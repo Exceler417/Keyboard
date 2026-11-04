@@ -168,3 +168,45 @@ test('チェック: 不明な動作・存在しないレイヤー・使われな
   assert.match(msgs, /warn:レイヤー2 に切り替えるキー/);
   assert.match(msgs, /info:.*SQT.*「:」/);
 });
+
+import { upsertBehavior, removeBehavior, behaviorUsages, validateBehaviorLabel } from '../js/dts.js';
+
+test('自作の動作を追加・更新・削除できる', () => {
+  let t = upsertBehavior(TEXT, { type: 'mod-morph', label: 'mm_q', displayName: 'Q/!', normal: '&kp Q', morphed: '&kp EXCL', mods: 2 | 32 });
+  t = upsertBehavior(t, { type: 'macro', label: 'hello', bindings: '&kp H &kp I', waitMs: 30, tapMs: 30 });
+  t = upsertBehavior(t, { type: 'hold-tap', label: 'ht2', hold: 'mo', tap: 'kp', flavor: 'tap-preferred', tappingTerm: 250, quickTap: 120 });
+  let p = parseKeymap(t);
+  assert.deepEqual(p.errors, []);
+  assert.equal(p.behaviors.mm_q.displayNameProp, 'Q/!');
+  assert.equal(p.behaviors.mm_q.mods, '(MOD_LSFT|MOD_RSFT)');
+  assert.equal(p.behaviors.hello.compatible, 'zmk,behavior-macro');
+  assert.equal(p.behaviors.ht2.tappingTerm, 250);
+  assert.equal(p.behaviors.ht2.quickTap, 120);
+  assert.equal(p.layers.length, 4);
+  // 更新（display-name を消し、keep-mods を追加）
+  t = upsertBehavior(t, { type: 'mod-morph', label: 'mm_q', displayName: '', normal: '&kp W', morphed: '&kp EXCL', mods: 1, keepMods: 1 });
+  p = parseKeymap(t);
+  assert.equal(p.behaviors.mm_q.displayNameProp, null);
+  assert.equal(bindingToString(p.behaviors.mm_q.bindings[0]), '&kp W');
+  assert.equal(p.behaviors.mm_q.keepMods, '(MOD_LCTL)');
+  // 既存の動作のほかのプロパティは残る
+  t = upsertBehavior(t, { type: 'hold-tap', label: 'hl', hold: 'mo', tap: 'kp', flavor: 'balanced', tappingTerm: 280, quickTap: 0 });
+  p = parseKeymap(t);
+  assert.equal(p.behaviors.hl.flavor, 'balanced');
+  assert.equal(p.behaviors.hl.tappingTerm, 280);
+  assert.equal(p.behaviors.hl.nodeName, 'hold_layer');
+  // シミュレーターで使える
+  const layers = p.layers.map((l) => l.bindings);
+  layers[0][0] = { behavior: 'mm_q', params: [] };
+  layers[0][1] = { behavior: 'hello', params: [] };
+  const { sim, tap } = makeSim({ ...p, layers: p.layers.map((l, i) => ({ ...l, bindings: layers[i] })) });
+  tap(0); tap(1);
+  assert.equal(sim.text, 'whi');
+  // 使用箇所と削除
+  assert.equal(behaviorUsages(p, [{ bindings: layers[0] }], 'hello').length, 1);
+  assert.ok(!parseKeymap(removeBehavior(t, 'hello')).behaviors.hello);
+  assert.match(validateBehaviorLabel('kp', p), /組み込み/);
+  assert.match(validateBehaviorLabel('Bad-Name', p), /小文字/);
+  assert.match(validateBehaviorLabel('mm_q', p), /すでに/);
+  assert.equal(validateBehaviorLabel('new_one', p), null);
+});

@@ -18,6 +18,7 @@
       </div>
     </div>
     <div class="actions">
+      <button id="deviceChip" class="device-chip hidden" title="本体の接続画面を開く"></button>
       <button id="btnUndo" title="元に戻す（Ctrl+Z）">↶ 元に戻す</button>
       <button id="btnRedo" title="やり直す（Ctrl+Y）">↷ やり直す</button>
       <button id="btnLoad">📂 読み込み</button>
@@ -36,6 +37,7 @@
     <button role="tab" data-mode="edit" class="active">✏️ 編集</button>
     <button role="tab" data-mode="sim">🧪 シミュレーター</button>
     <button role="tab" data-mode="test">🔌 実機テスト</button>
+    <button role="tab" data-mode="device">🔗 本体に接続</button>
     <button role="tab" data-mode="code">📄 コードとチェック <span class="badge" id="lintBadge"></span></button>
   </nav>
 
@@ -52,6 +54,7 @@
     <section class="panel hidden" id="panelSim"></section>
     <section class="panel hidden" id="panelTest"></section>
     <section class="panel hidden" id="panelCode"></section>
+    <section class="panel hidden" id="panelDevice"></section>
   </main>
 
   <dialog id="dlg"><form method="dialog" id="dlgBody"></form></dialog>

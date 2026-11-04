@@ -9,6 +9,9 @@ import { describeBinding, flavorJa } from './describe.js';
 import { Simulator, guessMouseLayer } from './sim.js';
 import { lintKeymap } from './lint.js';
 import * as GH from './github.js';
+import { StudioDevice, serialSupported, bluetoothSupported, LOCKED } from './studio.js';
+import { matchBehaviors, encodeBinding, decodeBinding, compareKeymaps, sameDevBinding } from './studio-map.js';
+import { upsertBehavior, removeBehavior, behaviorUsages, validateBehaviorLabel, behaviorType } from './dts.js';
 
 const KEY_COUNT = ZONKEY_LAYOUT.length;
 const STORE_KEY = 'zonkey-kobo:v1';
@@ -69,6 +72,7 @@ const state = {
   mouseLayer: null,
   sim: { pcKeys: true, latch: false, viewLayer: null },
   test: { on: false, tested: {}, last: null },
+  device: { dev: null, kind: null, match: null, live: true, busy: false, compare: null, connecting: false },
 };
 
 function layerNames() {
@@ -80,27 +84,33 @@ function snapshotLayers() {
   return state.layers.map((l) => ({ ...l, bindings: l.bindings.map(cloneB) }));
 }
 
-function commit(mutator, { keepFuture = false } = {}) {
-  state.history.push(snapshotLayers());
+function commit(mutator, { keepFuture = false, noPush = false } = {}) {
+  const before = snapshotLayers();
+  state.history.push(before);
   if (state.history.length > 200) state.history.shift();
   if (!keepFuture) state.future = [];
   mutator();
   changed();
+  if (!noPush) liveSyncChanges(before);
 }
 
 function undo() {
   if (!state.history.length) return;
-  state.future.push(snapshotLayers());
+  const before = snapshotLayers();
+  state.future.push(before);
   state.layers = state.history.pop();
   state.current = Math.min(state.current, state.layers.length - 1);
   changed();
+  liveSyncChanges(before);
   toast('元に戻しました');
 }
 function redo() {
   if (!state.future.length) return;
-  state.history.push(snapshotLayers());
+  const before = snapshotLayers();
+  state.history.push(before);
   state.layers = state.future.pop();
   changed();
+  liveSyncChanges(before);
   toast('やり直しました');
 }
 
@@ -162,6 +172,8 @@ function onSimChange() {
 
 function changed() {
   sim.setLayers(state.layers.map((l) => l.bindings));
+  if (state.device.dev) refreshDeviceCompare();
+  renderDeviceChip();
   renderSource();
   renderLayerTabs();
   renderBoard();
@@ -324,6 +336,10 @@ function renderBoard() {
       if (snap.queued.includes(pos)) el.classList.add('queued');
       void fromLayer;
     }
+    if (state.mode === 'device' && deviceDiffSet) {
+      if (deviceDiffSet.diff.has(view + ':' + pos)) el.classList.add('diff');
+      if (deviceDiffSet.err.has(view + ':' + pos)) el.classList.add('bad');
+    }
     if (state.mode === 'test') {
       if (tested.has(pos)) el.classList.add('tested');
       if (!testUsages(view, pos).size) el.classList.add('untestable');
@@ -452,11 +468,12 @@ const BEHAVIOR_CHOICES = [
 ];
 
 function renderPanel() {
-  ['Edit', 'Sim', 'Test', 'Code'].forEach((n) => $('panel' + n).classList.toggle('hidden', state.mode !== n.toLowerCase()));
+  ['Edit', 'Sim', 'Test', 'Code', 'Device'].forEach((n) => $('panel' + n).classList.toggle('hidden', state.mode !== n.toLowerCase()));
   if (state.mode === 'edit') renderEditPanel();
   else if (state.mode === 'sim') renderSimPanel();
   else if (state.mode === 'test') renderTestPanel();
   else if (state.mode === 'code') renderCodePanel();
+  else if (state.mode === 'device') renderDevicePanel();
 }
 
 function renderEditPanel() {
@@ -506,16 +523,16 @@ function renderEditPanel() {
       }, label));
     }
     left.append(h('h3', {}, '動作の種類'), choices);
-    if (customs.length) {
+    {
+      const devMissing = (label) => state.device.dev && state.device.match && !state.device.match.byLabel.has(label);
       const sel = h('select', {
         onchange: (e) => { if (e.target.value) setBinding(pos, convertBinding(b, e.target.value)); },
-      }, h('option', { value: '' }, '— キーマップ内で定義された動作 —'),
-      customs.map((c) => {
-        const dd = describeBinding({ behavior: c.label, params: Array.from({ length: c.bindingCells || 0 }, () => 'A') }, ctx());
-        const sum = c.compatible === 'zmk,behavior-mod-morph' ? `${dd.tap} / ⇧${dd.shift}` : c.compatible.replace('zmk,behavior-', '');
-        return h('option', { value: c.label, selected: b.behavior === c.label }, `${c.label}（${sum}）`);
-      }));
-      left.append(h('div', { class: 'row', style: { marginTop: '6px' } }, sel));
+      }, h('option', { value: '' }, customs.length ? '— 自作の動作から選ぶ —' : '（自作の動作はまだありません）'),
+      customs.map((c) => h('option', { value: c.label, selected: b.behavior === c.label },
+        `${c.displayNameProp || c.label}（${behaviorSummary(c)}）${devMissing(c.label) ? ' ※本体に未搭載' : ''}`)));
+      left.append(h('h3', {}, '自作の動作'), h('div', { class: 'row' }, sel,
+        h('button', { onclick: () => openBehaviorManager() }, '⚙ 作成・編集')));
+      if (devMissing(b.behavior)) left.append(h('p', { class: 'warn-text' }, `「&${b.behavior}」は接続中の本体のファームウェアにまだありません。GitHub に保存してビルド・書き込みすると本体でも使えます。`));
     }
 
     left.append(h('div', { class: 'row', style: { marginTop: '12px' } },
@@ -1294,6 +1311,574 @@ function openSaveDialog() {
   });
 }
 
+// ---------------------------------------------------------------- 本体（ZMK Studio）
+
+let deviceDiffSet = null;
+
+function deviceCtx() {
+  const d = state.device.dev;
+  return { parsed: state.parsed, match: state.device.match, layerIds: d.layerIds(), layerIndexById: d.layerIndexById() };
+}
+
+function refreshDeviceCompare() {
+  const d = state.device.dev;
+  if (!d || !d.keymap || !state.parsed) { state.device.compare = null; deviceDiffSet = null; return null; }
+  state.device.match = matchBehaviors(d.behaviors, state.parsed);
+  const cmp = compareKeymaps(state.layers, d.keymap, deviceCtx());
+  state.device.compare = cmp;
+  deviceDiffSet = {
+    diff: new Set(cmp.diffs.map((x) => x.layer + ':' + x.pos)),
+    err: new Set(cmp.errors.map((x) => x.layer + ':' + x.pos)),
+  };
+  return cmp;
+}
+
+function renderDeviceChip() {
+  const chip = $('deviceChip');
+  const d = state.device.dev;
+  if (!d) { chip.classList.add('hidden'); return; }
+  chip.classList.remove('hidden');
+  chip.textContent = `🔗 ${d.info?.name || '本体'}${state.device.live ? '・ライブ' : ''}${d.unsaved ? '・未保存' : ''}`;
+  chip.className = 'device-chip' + (d.unsaved ? ' unsaved' : '');
+}
+
+async function connectDevice(kind, makeTransport) {
+  if (state.device.connecting) return;
+  state.device.connecting = true;
+  renderDevicePanel();
+  try {
+    const dev = await StudioDevice.connect(kind, {
+      onNotify: async (n) => {
+        if (n.core?.lockStateChanged === 1 && !dev.keymap) {
+          try { await dev.loadAll(); toast('ロックが解除されました'); } catch (e) { toast(e.message); }
+        }
+        refreshDeviceCompare();
+        renderDeviceChip();
+        if (state.mode === 'device') { renderDevicePanel(); renderBoard(); }
+      },
+      onDisconnect: () => {
+        if (state.device.dev !== dev) return;
+        state.device.dev = null;
+        state.device.compare = null;
+        deviceDiffSet = null;
+        toast('本体との接続が切れました', 3500);
+        renderDeviceChip();
+        if (state.mode === 'device') { renderDevicePanel(); renderBoard(); }
+        if (state.mode === 'edit') renderEditPanel();
+      },
+    }, makeTransport);
+    state.device.dev = dev;
+    state.device.kind = kind;
+    const cmp = refreshDeviceCompare();
+    // 違いがあるときは、勝手に上書きしないようライブ反映を止めておく
+    state.device.live = !!cmp && cmp.diffs.length === 0;
+    toast(`${dev.info?.name || '本体'} に接続しました`);
+  } catch (e) {
+    if (!/cancel|キャンセル|No port selected|User cancelled/i.test(String(e?.message || e))) alert('接続できませんでした:\n' + (e?.message || e));
+  } finally {
+    state.device.connecting = false;
+    renderDeviceChip();
+    renderDevicePanel();
+    renderBoard();
+  }
+}
+
+async function deviceOp(label, fn) {
+  if (state.device.busy) return;
+  state.device.busy = true;
+  renderDevicePanel();
+  try {
+    await fn();
+  } catch (e) {
+    alert(`${label}に失敗しました:\n${e.message || e}`);
+  } finally {
+    state.device.busy = false;
+    refreshDeviceCompare();
+    renderDeviceChip();
+    if (state.mode === 'device') { renderDevicePanel(); renderBoard(); }
+  }
+}
+
+/** アプリ → 本体（すべての違いを書き込む） */
+async function writeAllToDevice() {
+  const d = state.device.dev;
+  await deviceOp('本体への書き込み', async () => {
+    // レイヤーが足りなければ追加
+    let need = state.layers.length - d.keymap.layers.length;
+    if (need > 0) {
+      if (d.keymap.availableLayers >= need && confirm(`本体のレイヤーが ${need} 個足りません。本体に追加しますか？`)) {
+        while (need-- > 0) await d.addLayer();
+      }
+    }
+    const cmp = refreshDeviceCompare();
+    let n = 0;
+    for (const x of cmp.diffs) { await d.setBinding(x.layer, x.pos, x.enc); n++; }
+    for (const nd of cmp.nameDiffs) { try { await d.setLayerName(nd.layer, nd.app.slice(0, d.keymap.maxLayerNameLength || 20)); } catch { /* 名前は必須ではない */ } }
+    const errs = cmp.errors.length;
+    toast(`${n} キーを本体に書き込みました${errs ? `（${errs} キーは書き込めませんでした）` : ''}。「本体に保存」で確定します。`, 4500);
+    state.device.live = true;
+  });
+}
+
+/** 本体 → アプリ */
+function importFromDevice() {
+  const d = state.device.dev;
+  const c = deviceCtx();
+  const fails = [];
+  commit(() => {
+    d.keymap.layers.forEach((L, li) => {
+      let target = state.layers[li];
+      if (!target) {
+        target = { origIndex: null, displayName: L.name || `layer ${li}`, bindings: Array.from({ length: KEY_COUNT }, TRANS), sensorBindings: null };
+        state.layers.push(target);
+      } else if (L.name && L.name !== target.displayName && L.name !== state.parsed.layers[target.origIndex]?.nodeName) {
+        target.displayName = L.name;
+      }
+      L.bindings.forEach((vb, pos) => {
+        if (pos >= KEY_COUNT) return;
+        const cur = target.bindings[pos];
+        const enc = cur ? encodeBinding(cur, c) : null;
+        if (enc?.ok && sameDevBinding(enc.value, vb)) return;
+        const dec = decodeBinding(vb, c);
+        if (dec.ok) target.bindings[pos] = dec.value;
+        else fails.push(`レイヤー${li}・${positionName(pos)}: ${dec.error}`);
+      });
+    });
+  }, { noPush: true });
+  refreshDeviceCompare();
+  state.device.live = true;
+  renderDevicePanel(); renderBoard();
+  toast(fails.length ? `読み込みました（${fails.length} キーは変換できませんでした）` : '本体のキーマップをアプリに読み込みました。GitHub にも保存すると .keymap がそろいます。', 5000);
+  if (fails.length) alert('変換できなかったキー:\n' + fails.slice(0, 20).join('\n'));
+}
+
+let livePending = [];
+let liveTimer = null;
+/** 編集した位置だけ本体に送る */
+function liveSyncChanges(before) {
+  const d = state.device.dev;
+  if (!d || !d.keymap || !state.device.live) return;
+  for (let li = 0; li < state.layers.length; li++) {
+    const A = state.layers[li].bindings;
+    const B = before[li]?.bindings || [];
+    for (let pos = 0; pos < A.length; pos++) {
+      if (!B[pos] || bindingToString(A[pos]) !== bindingToString(B[pos])) livePending.push([li, pos]);
+    }
+    if ((state.layers[li].displayName || '') !== (before[li]?.displayName || '')) livePending.push([li, 'name']);
+  }
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(flushLive, 120);
+}
+
+async function flushLive() {
+  const d = state.device.dev;
+  if (!d || state.device.busy) { if (d) liveTimer = setTimeout(flushLive, 200); return; }
+  const items = livePending.splice(0);
+  if (!items.length) return;
+  state.device.busy = true;
+  const problems = [];
+  let n = 0;
+  try {
+    const c = deviceCtx();
+    for (const [li, pos] of items) {
+      if (li >= d.keymap.layers.length) { problems.push(`本体にレイヤー${li} がありません`); continue; }
+      if (pos === 'name') { try { await d.setLayerName(li, (state.layers[li].displayName || '').slice(0, d.keymap.maxLayerNameLength || 20)); } catch { /* ignore */ } continue; }
+      const b = state.layers[li].bindings[pos];
+      const enc = encodeBinding(b, c);
+      if (!enc.ok) { problems.push(enc.error); continue; }
+      if (sameDevBinding(enc.value, d.keymap.layers[li].bindings[pos])) continue;
+      await d.setBinding(li, pos, enc.value);
+      n++;
+    }
+  } catch (e) {
+    problems.push(e.message || String(e));
+  } finally {
+    state.device.busy = false;
+  }
+  refreshDeviceCompare();
+  renderDeviceChip();
+  if (problems.length) toast('本体に反映できませんでした: ' + [...new Set(problems)].join(' / '), 6000);
+  else if (n) toast(`本体に反映しました（${n} キー・未保存）`, 1800);
+  if (state.mode === 'device') { renderDevicePanel(); renderBoard(); }
+}
+
+function renderDevicePanel() {
+  const panel = $('panelDevice');
+  if (state.mode !== 'device') return;
+  panel.replaceChildren();
+  const d = state.device.dev;
+  if (!d) {
+    const usb = serialSupported();
+    const ble = bluetoothSupported();
+    panel.append(h('div', { class: 'grid2' },
+      h('div', {},
+        h('h2', {}, '本体（Zonkey）に直接書き込む'),
+        h('p', {}, 'ZMK Studio と同じ仕組みで、ビルドや書き込みをせずにキーマップを変更できます。'),
+        h('ol', { style: { paddingLeft: '18px' } },
+          h('li', {}, 'Zonkey の右手側（PC とつながる側）を USB ケーブルで PC に接続'),
+          h('li', {}, '下の「USB で接続」を押して、表示された一覧から Zonkey を選ぶ'),
+          h('li', {}, 'あとは「編集」画面で変更すると、すぐ本体に反映されます'),
+        ),
+        h('div', { class: 'row' },
+          h('button', { class: 'primary', disabled: !usb || state.device.connecting, onclick: () => connectDevice('usb') }, state.device.connecting ? '接続中…' : '🔌 USB で接続'),
+          h('button', { disabled: !ble || state.device.connecting, onclick: () => connectDevice('ble'), title: 'Bluetooth 接続（ファームが Bluetooth での Studio 接続に対応している場合）' }, '📶 Bluetooth で接続（試験的）'),
+        ),
+        !usb ? h('p', { class: 'warn-text' }, 'このブラウザは USB 接続（Web Serial）に対応していません。パソコンの Chrome か Edge で開いてください。') : null,
+      ),
+      h('div', {},
+        h('h3', {}, '知っておくこと'),
+        h('ul', { class: 'muted', style: { paddingLeft: '18px' } },
+          h('li', {}, '本体への変更は「本体に保存」を押すまで仮の状態です（電源を切ると元に戻ります）。'),
+          h('li', {}, '本体に保存した内容は GitHub の .keymap には入りません。両方そろえたいときは「💾 保存」で GitHub にも保存してください。'),
+          h('li', {}, 'ファームウェアに入っている動作だけ使えます。新しく作った自作の動作は、GitHub に保存してビルド・書き込みした後に使えるようになります。'),
+          h('li', {}, 'エンコーダー（sensor-bindings）は本体からは変更できません。'),
+          h('li', {}, 'Zonkey 公式のファームは ZMK Studio 対応済み（右手側・USB）です。'),
+        ),
+      ),
+    ));
+    return;
+  }
+
+  const busy = state.device.busy;
+  const head = h('div', { class: 'row' },
+    h('h2', { style: { margin: 0 } }, `🔗 ${d.info?.name || '本体'} に接続中（${state.device.kind === 'ble' ? 'Bluetooth' : 'USB'}）`),
+    h('span', { class: 'spacer' }),
+    h('button', { onclick: () => d.disconnect() }, '切断'),
+  );
+  panel.append(head);
+
+  if (d.lockState === LOCKED || !d.keymap) {
+    panel.append(h('div', { class: 'desc', style: { marginTop: '10px' } }, '🔒 本体がロックされています。Zonkey に割り当てた「Studio Unlock」キーを押してください（解除されると自動で読み込みます）。'));
+    return;
+  }
+
+  const cmp = state.device.compare || refreshDeviceCompare();
+  const missing = [...new Set(cmp.errors.filter((e) => e.missing).map((e) => e.behavior))];
+  const status = h('div', { class: 'desc', style: { marginTop: '10px' } },
+    cmp.diffs.length === 0 && cmp.errors.length === 0
+      ? '✅ アプリの内容と本体のキーマップは一致しています。'
+      : `アプリと本体で ${cmp.diffs.length} キー違います${cmp.errors.length ? `（ほかに書き込めないキー ${cmp.errors.length}）` : ''}。`,
+    cmp.layerCountApp !== cmp.layerCountDev ? h('div', {}, `レイヤー数: アプリ ${cmp.layerCountApp} / 本体 ${cmp.layerCountDev}（本体の空き ${d.keymap.availableLayers}）`) : null,
+    d.unsaved ? h('div', { class: 'warn-text' }, '本体に未保存の変更があります。「本体に保存」を押すと、電源を切っても残ります。') : null,
+  );
+  panel.append(status);
+
+  const liveCb = h('input', { type: 'checkbox', checked: state.device.live, onchange: (e) => { state.device.live = e.target.checked; renderDeviceChip(); } });
+  panel.append(h('div', { class: 'row', style: { marginTop: '10px' } },
+    h('button', { class: 'primary', disabled: busy || !cmp.diffs.length && cmp.layerCountApp <= cmp.layerCountDev, onclick: writeAllToDevice }, `⬆ アプリ → 本体に書き込む（${cmp.diffs.length}）`),
+    h('button', { disabled: busy || !cmp.diffs.length && cmp.layerCountApp >= cmp.layerCountDev, onclick: () => { if (confirm('本体のキーマップでアプリの内容を置き換えますか？（元に戻すで戻せます）')) importFromDevice(); } }, '⬇ 本体 → アプリに読み込む'),
+    h('button', { disabled: busy || !d.unsaved, onclick: () => deviceOp('保存', async () => { await d.save(); toast('本体に保存しました'); }) }, '💾 本体に保存'),
+    h('button', { disabled: busy || !d.unsaved, onclick: () => { if (confirm('本体の未保存の変更を取り消しますか？')) deviceOp('取り消し', async () => { await d.discard(); toast('取り消しました'); }); } }, '↩ 未保存の変更を取り消す'),
+  ));
+  panel.append(h('label', { class: 'toggle', style: { marginTop: '8px' } }, liveCb, 'ライブ編集: 「編集」画面での変更をすぐ本体に反映する'));
+  if (busy) panel.append(h('p', { class: 'muted' }, '本体と通信中…'));
+
+  if (missing.length) {
+    panel.append(h('div', { class: 'desc warn-box', style: { marginTop: '10px' } },
+      h('b', {}, 'ファームウェアにまだない動作: '), missing.map((m) => '&' + m).join(', '),
+      h('div', {}, 'これらは本体に書き込めません。「💾 保存」で GitHub に保存 → ビルドされたファームを書き込むと使えるようになります。'),
+    ));
+  }
+
+  const grid = h('div', { class: 'grid2', style: { marginTop: '12px' } });
+  const names = layerNames();
+  const diffList = h('ul', { class: 'lint' });
+  const showDiffs = [...cmp.errors.map((x) => ({ ...x, kind: 'err' })), ...cmp.diffs.map((x) => ({ ...x, kind: 'diff' }))].slice(0, 150);
+  for (const x of showDiffs) {
+    const appB = state.layers[x.layer].bindings[x.pos];
+    let devText = '';
+    if (x.kind === 'diff') {
+      const dec = decodeBinding(x.dev, deviceCtx());
+      devText = dec.ok ? describeBinding(dec.value, ctx()).tap + `（${bindingToString(dec.value)}）` : dec.error;
+    }
+    diffList.append(h('li', {
+      class: x.kind === 'err' ? 'error' : 'warn',
+      onclick: () => { state.current = x.layer; renderLayerTabs(); renderBoard(); },
+      title: 'クリックでそのレイヤーを表示',
+    }, `L${x.layer} ${names[x.layer]}・${positionName(x.pos)}: アプリ「${describeBinding(appB, ctx()).tap}」(${bindingToString(appB)})`,
+      x.kind === 'diff' ? ` ／ 本体「${devText}」` : ` — ${x.error}`));
+  }
+  grid.append(h('div', {},
+    h('h3', {}, '違うキー（青い枠）・書き込めないキー（赤い枠）'),
+    showDiffs.length ? diffList : h('p', { class: 'muted' }, 'ありません'),
+  ));
+
+  const behList = h('ul', { class: 'log' });
+  for (const b of d.behaviors) {
+    const m = state.device.match.byId.get(b.id);
+    behList.append(h('li', {}, `${b.displayName}`, m?.label ? h('span', { class: 'muted' }, ` → &${m.label}`) : h('span', { class: 'warn-text' }, ' （.keymap に定義なし）')));
+  }
+  grid.append(h('div', {},
+    h('h3', {}, `本体で使える動作（${d.behaviors.length}）`),
+    behList,
+    h('h3', {}, '本体の設定'),
+    h('div', { class: 'row' },
+      h('button', { disabled: busy, onclick: () => deviceOp('再読み込み', async () => { await d.loadAll(); toast('本体から読み込み直しました'); }) }, '🔄 本体から読み直す'),
+      h('button', { class: 'danger', disabled: busy, onclick: () => { if (confirm('本体で変更・保存したキーマップをすべて消して、ファームウェアのキーマップに戻しますか？')) deviceOp('初期化', async () => { await d.resetSettings(); toast('ファームウェアのキーマップに戻しました'); }); } }, '⚠ ファームの初期キーマップに戻す'),
+    ),
+  ));
+  panel.append(grid);
+}
+
+// ---------------------------------------------------------------- 自作の動作
+
+function behaviorSummary(c) {
+  const t = behaviorType(c.compatible);
+  if (t === 'mod-morph') {
+    const dd = describeBinding({ behavior: c.label, params: [] }, ctx());
+    return `Shift等で変化: ${dd.tap} / ${dd.shift}`;
+  }
+  if (t === 'hold-tap') return `タップ／長押し（${flavorJa(c.flavor || 'hold-preferred')}・${c.tappingTerm ?? 200}ms）`;
+  if (t === 'macro') return `マクロ: ${c.bindings.slice(0, 6).map((b) => describeBinding(b, ctx()).tap).join(' ')}${c.bindings.length > 6 ? '…' : ''}`;
+  if (/macro/.test(c.compatible)) return 'マクロ（パラメーター付き）';
+  if (/sensor-rotate/.test(c.compatible)) return 'エンコーダー用';
+  return c.compatible.replace('zmk,behavior-', '');
+}
+
+/** キーマップのテキストを変更（自作の動作など）して読み直す */
+function applyTextChange(text) {
+  const base = state.baseText;
+  const sel = state.selected;
+  setBase(text, state.origin, { keepView: true });
+  state.baseText = base;
+  state.selected = sel;
+  refreshDeviceCompare();
+  changed();
+}
+
+function openBehaviorManager() {
+  openDialog((form, close) => {
+    const list = h('div', { style: { display: 'grid', gap: '6px' } });
+    const customs = Object.values(state.parsed.behaviors);
+    if (!customs.length) list.append(h('p', { class: 'muted' }, 'まだ自作の動作はありません。'));
+    for (const c of customs) {
+      const t = behaviorType(c.compatible);
+      const uses = behaviorUsages(state.parsed, state.layers, c.label);
+      const devMissing = state.device.dev && state.device.match && !state.device.match.byLabel.has(c.label) && !/sensor/.test(c.compatible);
+      list.append(h('div', { class: 'beh-row' },
+        h('div', {},
+          h('b', {}, '&' + c.label), c.displayNameProp ? ` 「${c.displayNameProp}」` : '',
+          h('div', { class: 'muted', style: { fontSize: '12px' } }, behaviorSummary(c), ` ・ 使用 ${uses.length} か所`, devMissing ? ' ・ 本体に未搭載' : ''),
+        ),
+        h('div', { class: 'row' },
+          t ? h('button', { class: 'small', onclick: (e) => { e.preventDefault(); close(); openBehaviorEditor(t, c.label); } }, '編集') : h('span', { class: 'muted', style: { fontSize: '12px' } }, 'コードで編集'),
+          t ? h('button', {
+            class: 'small danger', onclick: (e) => {
+              e.preventDefault();
+              if (uses.length) { alert(`「&${c.label}」は ${uses.length} か所で使われているため削除できません。先にそのキーを変更してください。`); return; }
+              if (!confirm(`「&${c.label}」を削除しますか？`)) return;
+              applyTextChange(removeBehavior(output(), c.label));
+              close(); openBehaviorManager(); toast('削除しました');
+            },
+          }, '削除') : null,
+        ),
+      ));
+    }
+    form.append(
+      h('h2', {}, '⚙ 自作の動作'),
+      h('p', { class: 'muted' }, 'ここで作った動作は .keymap に追加され、どのキーにも割り当てられます（シミュレーターでも試せます）。'),
+      h('div', { class: 'row' },
+        h('button', { onclick: (e) => { e.preventDefault(); close(); openBehaviorEditor('mod-morph'); } }, '＋ Shift で変わるキー'),
+        h('button', { onclick: (e) => { e.preventDefault(); close(); openBehaviorEditor('hold-tap'); } }, '＋ タップ／長押し'),
+        h('button', { onclick: (e) => { e.preventDefault(); close(); openBehaviorEditor('macro'); } }, '＋ マクロ（連続入力）'),
+      ),
+      list,
+      h('div', { class: 'note' }, '本体に直接書き込む場合: 新しく作った動作は、GitHub に保存してビルドしたファームを書き込むと本体でも使えるようになります。'),
+      h('div', { class: 'footer' }, h('button', { onclick: close }, '閉じる')),
+    );
+  });
+}
+
+/** 「&kp X」形式の入力欄＋キー選択 */
+function bindingField(value, onChange) {
+  const wrap = h('div', { class: 'bfield' });
+  let open = false;
+  const draw = () => {
+    wrap.replaceChildren();
+    const b = parseBindingString(value) || { behavior: 'kp', params: ['A'] };
+    const inp = h('input', { type: 'text', class: 'code-input', value, spellcheck: false, style: { flex: 1 } });
+    inp.addEventListener('change', () => { if (parseBindingString(inp.value)) { value = inp.value.trim(); onChange(value); draw(); } else toast('「&kp A」のように入力してください'); });
+    wrap.append(h('div', { class: 'row' },
+      h('b', { style: { minWidth: '60px' } }, describeBinding(b, ctx()).tap), inp,
+      h('button', { onclick: (e) => { e.preventDefault(); open = !open; draw(); } }, open ? '閉じる' : 'キーを選ぶ'),
+    ));
+    if (open) {
+      wrap.append(keyPicker(b.behavior === 'kp' ? b.params[0] : 'A', (k) => { value = `&kp ${k}`; onChange(value); draw(); }));
+    }
+  };
+  draw();
+  return wrap;
+}
+
+function textToMacro(text, host) {
+  const table = charTable(host);
+  const out = [];
+  for (const ch of text) {
+    if (/[a-z]/.test(ch)) out.push('&kp ' + ch.toUpperCase());
+    else if (/[A-Z]/.test(ch)) out.push(`&kp LS(${ch})`);
+    else if (/[0-9]/.test(ch)) out.push('&kp N' + ch);
+    else if (ch === ' ') out.push('&kp SPACE');
+    else if (ch === '\n') out.push('&kp RET');
+    else if (ch === '\t') out.push('&kp TAB');
+    else {
+      const t = table.find((c) => c.ch === ch);
+      if (!t) throw new Error(`「${ch}」は入力できません（日本語などはマクロで直接入力できません）`);
+      out.push('&kp ' + t.expr);
+    }
+  }
+  return out.join(' ');
+}
+
+function openBehaviorEditor(type, label = null) {
+  const existing = label ? state.parsed.behaviors[label] : null;
+  const MODS = parseModMaskBits;
+  const def = {
+    type,
+    label: label || '',
+    displayName: existing?.displayNameProp || '',
+  };
+  if (type === 'mod-morph') {
+    def.normal = existing ? bindingToString(existing.bindings[0]) : '&kp N2';
+    def.morphed = existing ? bindingToString(existing.bindings[1]) : (state.host === 'jis' ? '&kp LBKT' : '&kp AT');
+    def.mods = existing ? MODS(existing.mods) : 2 | 32;
+    def.keepMods = existing ? MODS(existing.keepMods) : 0;
+  } else if (type === 'hold-tap') {
+    def.hold = existing?.bindings[0]?.behavior || 'mo';
+    def.tap = existing?.bindings[1]?.behavior || 'kp';
+    def.flavor = existing?.flavor || 'balanced';
+    def.tappingTerm = existing?.tappingTerm ?? 200;
+    def.quickTap = existing?.quickTap ?? 0;
+  } else {
+    def.bindings = existing ? existing.bindings.map(bindingToString).join(' ') : '&kp H &kp E &kp L &kp L &kp O';
+    def.waitMs = existing?.waitMs ?? 30;
+    def.tapMs = existing?.tapMs ?? 30;
+  }
+  const canAssign = !label && state.selected != null;
+  const title = { 'mod-morph': 'Shift で変わるキー（mod-morph）', 'hold-tap': 'タップ／長押し（hold-tap）', macro: 'マクロ（macro）' }[type];
+
+  openDialog((form, close) => {
+    const err = h('div', { class: 'err' });
+    const labelIn = h('input', { type: 'text', value: def.label, placeholder: '例: my_key', disabled: !!label, spellcheck: false });
+    const dnIn = h('input', { type: 'text', value: def.displayName, placeholder: '例: 2 / @（ZMK Studio などで表示される名前）' });
+    const body = h('div', { style: { display: 'grid', gap: '10px' } });
+    const modBoxes = (bits, onChange) => h('div', { class: 'mods' }, [['Shift', 2 | 32], ['Ctrl', 1 | 16], ['Alt', 4 | 64], ['Win/Cmd', 8 | 128]].map(([n, m]) => {
+      const cb = h('input', { type: 'checkbox', checked: (bits & m) !== 0 });
+      cb.addEventListener('change', () => { bits = cb.checked ? bits | m : bits & ~m; onChange(bits); });
+      return h('label', {}, cb, n);
+    }));
+
+    if (type === 'mod-morph') {
+      body.append(
+        h('div', { class: 'field' }, h('span', { class: 'muted' }, 'ふつうに押したとき'), bindingField(def.normal, (v) => { def.normal = v; })),
+        h('div', { class: 'field' }, h('span', { class: 'muted' }, '一緒に押すと変化する修飾キー'), modBoxes(def.mods, (v) => { def.mods = v; })),
+        h('div', { class: 'field' }, h('span', { class: 'muted' }, '修飾キーと一緒に押したとき'), bindingField(def.morphed, (v) => { def.morphed = v; })),
+        h('label', { class: 'toggle' }, (() => { const cb = h('input', { type: 'checkbox', checked: !!def.keepMods }); cb.addEventListener('change', () => { def.keepMods = cb.checked ? def.mods : 0; }); return cb; })(),
+          '変化後も修飾キーを押したままにする（keep-mods。例: Shift+BS → Shift+Delete）'),
+        h('div', { class: 'note' }, '例: ふつうは「2」、Shift と一緒なら「@」。JIS の PC で記号の位置を US 配列風にしたいときなどに便利です。'),
+      );
+    } else if (type === 'hold-tap') {
+      const holdSel = h('select', { onchange: (e) => { def.hold = e.target.value; } },
+        h('option', { value: 'mo', selected: def.hold === 'mo' }, 'レイヤー（押している間）&mo'),
+        h('option', { value: 'kp', selected: def.hold === 'kp' }, 'キー・修飾キー &kp'),
+        h('option', { value: 'sl', selected: def.hold === 'sl' }, 'ワンショットレイヤー &sl'),
+        h('option', { value: 'tog', selected: def.hold === 'tog' }, 'レイヤー固定 &tog'));
+      const tapSel = h('select', { onchange: (e) => { def.tap = e.target.value; } },
+        h('option', { value: 'kp', selected: def.tap === 'kp' }, 'キー &kp'),
+        h('option', { value: 'mo', selected: def.tap === 'mo' }, 'レイヤー &mo'),
+        h('option', { value: 'tog', selected: def.tap === 'tog' }, 'レイヤー固定 &tog'));
+      const flavorSel = h('select', { onchange: (e) => { def.flavor = e.target.value; } },
+        [['balanced', 'バランス（他のキーを押して離したら長押し）'], ['hold-preferred', '長押し優先（他のキーを押したらすぐ長押し）'], ['tap-preferred', 'タップ優先（時間だけで判定）'], ['tap-unless-interrupted', '割り込みで長押し（時間が過ぎてもタップ）']]
+          .map(([v, l]) => h('option', { value: v, selected: def.flavor === v }, l)));
+      const tt = h('input', { type: 'number', min: 50, max: 2000, step: 10, value: def.tappingTerm });
+      tt.addEventListener('change', () => { def.tappingTerm = tt.value; });
+      const qt = h('input', { type: 'number', min: 0, max: 2000, step: 10, value: def.quickTap });
+      qt.addEventListener('change', () => { def.quickTap = qt.value; });
+      body.append(
+        h('div', { class: 'grid2' },
+          h('label', { class: 'field' }, h('span', { class: 'muted' }, '長押ししたとき'), holdSel),
+          h('label', { class: 'field' }, h('span', { class: 'muted' }, 'タップしたとき'), tapSel)),
+        h('label', { class: 'field' }, h('span', { class: 'muted' }, '判定の方式（flavor）'), flavorSel),
+        h('div', { class: 'grid2' },
+          h('label', { class: 'field' }, h('span', { class: 'muted' }, '長押しと判定する時間（ms）'), tt),
+          h('label', { class: 'field' }, h('span', { class: 'muted' }, 'クイックタップ（ms・0 で無効）'), qt)),
+        h('div', { class: 'note' }, '割り当てたキーで「長押しのレイヤー／キー」と「タップのキー」を指定します。lt / mt の判定時間や方式を変えた版を作りたいときに使います。'),
+      );
+    } else {
+      const ta = h('textarea', { class: 'code', style: { minHeight: '90px' }, spellcheck: false });
+      ta.value = def.bindings;
+      ta.addEventListener('change', () => { def.bindings = ta.value; });
+      const textIn = h('input', { type: 'text', placeholder: '例: hello@example.com', style: { flex: 1 } });
+      const wait = h('input', { type: 'number', min: 0, max: 1000, value: def.waitMs });
+      wait.addEventListener('change', () => { def.waitMs = wait.value; });
+      const tap = h('input', { type: 'number', min: 0, max: 1000, value: def.tapMs });
+      tap.addEventListener('change', () => { def.tapMs = tap.value; });
+      body.append(
+        h('div', { class: 'field' }, h('span', { class: 'muted' }, '文字列から作る（英数字・記号）'),
+          h('div', { class: 'row' }, textIn, h('button', {
+            onclick: (e) => {
+              e.preventDefault();
+              try { ta.value = textToMacro(textIn.value, state.host); def.bindings = ta.value; err.textContent = ''; } catch (x) { err.textContent = x.message; }
+            },
+          }, '変換'))),
+        h('div', { class: 'field' }, h('span', { class: 'muted' }, '送るキー（順番に押されます）'), ta),
+        h('div', { class: 'grid2' },
+          h('label', { class: 'field' }, h('span', { class: 'muted' }, 'キーの間隔（wait-ms）'), wait),
+          h('label', { class: 'field' }, h('span', { class: 'muted' }, '押している時間（tap-ms）'), tap)),
+        h('div', { class: 'note' }, 'ショートカットの組み合わせ（例: &kp LC(C) &kp LC(V)）も書けます。'),
+      );
+    }
+
+    const assignCb = h('input', { type: 'checkbox', checked: canAssign });
+    form.append(
+      h('h2', {}, (label ? '編集: ' : '新規: ') + title),
+      h('div', { class: 'grid2' },
+        h('label', { class: 'field' }, h('span', {}, '名前（キーマップで &名前 として使う）'), labelIn),
+        h('label', { class: 'field' }, h('span', {}, '表示名（任意）'), dnIn)),
+      body,
+      canAssign ? h('label', { class: 'toggle' }, assignCb, `選択中のキー（レイヤー${state.current}・${positionName(state.selected)}）に割り当てる`) : null,
+      err,
+      h('div', { class: 'footer' },
+        h('button', { onclick: (e) => { e.preventDefault(); close(); openBehaviorManager(); } }, '戻る'),
+        h('button', {
+          class: 'primary', onclick: (e) => {
+            e.preventDefault();
+            def.label = labelIn.value.trim();
+            def.displayName = dnIn.value.trim();
+            const v = validateBehaviorLabel(def.label, state.parsed, label);
+            if (v) { err.textContent = v; return; }
+            if (type === 'mod-morph') {
+              if (!parseBindingString(def.normal) || !parseBindingString(def.morphed)) { err.textContent = 'キーを正しく指定してください'; return; }
+              if (!def.mods) { err.textContent = '変化させる修飾キーを 1 つ以上選んでください'; return; }
+              if (def.keepMods) def.keepMods = def.mods;
+            }
+            if (type === 'macro' && !/&\w+/.test(def.bindings || '')) { err.textContent = '送るキーを入力してください'; return; }
+            try {
+              const text = upsertBehavior(output(), def);
+              const pos = state.selected;
+              const assign = canAssign && assignCb.checked;
+              applyTextChange(text);
+              if (assign) {
+                const params = type === 'hold-tap' ? [def.hold === 'kp' ? 'LSHIFT' : '1', def.tap === 'kp' ? 'A' : '1'] : [];
+                setBinding(pos, { behavior: def.label, params });
+              }
+              close();
+              toast(`「&${def.label}」を${label ? '更新' : '作成'}しました${state.device.dev ? '。本体で使うには GitHub に保存してビルド・書き込みが必要です' : ''}`, 4500);
+            } catch (x) { err.textContent = x.message; }
+          },
+        }, label ? '更新' : '作成'),
+      ),
+    );
+  });
+}
+
+function parseModMaskBits(str) {
+  if (!str) return 0;
+  const map = { MOD_LCTL: 1, MOD_LSFT: 2, MOD_LALT: 4, MOD_LGUI: 8, MOD_RCTL: 16, MOD_RSFT: 32, MOD_RALT: 64, MOD_RGUI: 128 };
+  let m = 0;
+  for (const id of String(str).match(/MOD_[A-Z]+/g) || []) m |= map[id] || 0;
+  return m;
+}
+
 // ---------------------------------------------------------------- モード
 
 function setMode(mode) {
@@ -1301,6 +1886,7 @@ function setMode(mode) {
   if (state.mode === 'sim' && mode !== 'sim') { releaseAllPointers(); for (const pos of pcDown.values()) sim.release(pos); pcDown.clear(); }
   state.mode = mode;
   if (mode !== 'test') state.test.on = false;
+  if (mode === 'device') refreshDeviceCompare();
   if (mode === 'sim') state.sim.viewLayer = null;
   document.querySelectorAll('.modes button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
   $('boardArea').classList.toggle('hidden', false);
@@ -1370,7 +1956,9 @@ window.addEventListener('blur', () => {
   if (state.mode === 'sim') { for (const pos of pcDown.values()) sim.release(pos); pcDown.clear(); }
 });
 
-window.addEventListener('beforeunload', (e) => { if (isDirty() && state.origin.type === 'github') { e.preventDefault(); e.returnValue = ''; } });
+window.addEventListener('beforeunload', (e) => {
+  if ((isDirty() && state.origin.type === 'github') || state.device.dev?.unsaved) { e.preventDefault(); e.returnValue = ''; }
+});
 
 // ---------------------------------------------------------------- 起動
 
@@ -1380,6 +1968,7 @@ async function init() {
   $('btnRedo').addEventListener('click', redo);
   $('btnLoad').addEventListener('click', openLoadDialog);
   $('btnSave').addEventListener('click', openSaveDialog);
+  $('deviceChip').addEventListener('click', () => setMode('device'));
   $('hostSelect').addEventListener('change', (e) => { state.host = e.target.value; sim.setHost(state.host); changed(); });
   setupBoardPointer();
   let rt;
@@ -1415,5 +2004,5 @@ async function init() {
 init();
 
 // テストやデバッグ用
-window.__zonkey = { state, sim, output, setBase };
+window.__zonkey = { state, sim, output, setBase, connectDevice };
 void flavorJa;

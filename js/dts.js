@@ -228,6 +228,12 @@ export function parseKeymap(text) {
         tappingTerm: node.props['tapping-term-ms'] ? parseInt(expandDefines(propInts(node.props['tapping-term-ms'])[0], defines)) : null,
         quickTap: node.props['quick-tap-ms'] ? parseInt(expandDefines(propInts(node.props['quick-tap-ms'])[0], defines)) : null,
         displayName: propString(node.props['display-name']) || propString(node.props.label),
+        displayNameProp: propString(node.props['display-name']),
+        labelProp: propString(node.props.label),
+        nodeName: node.name,
+        waitMs: node.props['wait-ms'] ? parseInt(propInts(node.props['wait-ms'])[0]) : null,
+        tapMs: node.props['tap-ms'] ? parseInt(propInts(node.props['tap-ms'])[0]) : null,
+        node,
       };
       behaviors[node.label] = b;
     }
@@ -451,4 +457,157 @@ export function templateKeymap() {
     };
 };
 `;
+}
+
+// ---------------- 自作の動作（behaviors）の作成・編集 ----------------
+
+const BUILTIN_LABELS = new Set([
+  'kp', 'kt', 'lt', 'mt', 'mo', 'to', 'tog', 'sl', 'sk', 'trans', 'none', 'bt', 'out', 'mkp', 'msc', 'mmv',
+  'caps_word', 'key_repeat', 'bootloader', 'sys_reset', 'soft_off', 'studio_unlock', 'gresc', 'rgb_ug', 'bl',
+  'ext_power', 'inc_dec_kp',
+]);
+
+export const BEHAVIOR_TYPES = {
+  'mod-morph': 'zmk,behavior-mod-morph',
+  'hold-tap': 'zmk,behavior-hold-tap',
+  macro: 'zmk,behavior-macro',
+};
+
+export function behaviorType(compatible) {
+  return Object.keys(BEHAVIOR_TYPES).find((k) => BEHAVIOR_TYPES[k] === compatible) || null;
+}
+
+export function validateBehaviorLabel(label, parsed, editing) {
+  if (!/^[a-z_][a-z0-9_]*$/.test(label || '')) return '名前は半角の小文字・数字・_ で、先頭は英字にしてください（例: my_shift2）';
+  if (label.length > 20) return '名前は 20 文字以内にしてください';
+  if (BUILTIN_LABELS.has(label)) return `「${label}」は ZMK の組み込み動作と同じ名前です`;
+  if (label !== editing && parsed?.behaviors?.[label]) return `「${label}」はすでにあります`;
+  return null;
+}
+
+const MOD_MASKS = [['MOD_LCTL', 1], ['MOD_LSFT', 2], ['MOD_LALT', 4], ['MOD_LGUI', 8], ['MOD_RCTL', 16], ['MOD_RSFT', 32], ['MOD_RALT', 64], ['MOD_RGUI', 128]];
+export function modMaskExpr(bits) {
+  const names = MOD_MASKS.filter(([, b]) => bits & b).map(([n]) => n);
+  return names.length ? `<(${names.join('|')})>` : null;
+}
+
+/**
+ * def: { type, label, displayName, ... }
+ *  mod-morph: { normal: '&kp N2', morphed: '&kp LBKT', mods: bits, keepMods: bits }
+ *  hold-tap:  { hold: 'mo'|'kp', tap: 'kp', flavor, tappingTerm, quickTap }
+ *  macro:     { bindings: '&kp H &kp I', waitMs, tapMs }
+ * 戻り値: [ [prop, value|null], ... ]（順番どおりに書く）
+ */
+function behaviorProps(def) {
+  const props = [['compatible', `"${BEHAVIOR_TYPES[def.type]}"`]];
+  props.push(['display-name', def.displayName ? quote(def.displayName) : null]);
+  if (def.type === 'mod-morph') {
+    props.push(['#binding-cells', '<0>']);
+    props.push(['bindings', `<${def.normal}>, <${def.morphed}>`]);
+    props.push(['mods', modMaskExpr(def.mods) || '<(MOD_LSFT|MOD_RSFT)>']);
+    props.push(['keep-mods', modMaskExpr(def.keepMods || 0)]);
+  } else if (def.type === 'hold-tap') {
+    props.push(['#binding-cells', '<2>']);
+    props.push(['bindings', `<&${def.hold}>, <&${def.tap}>`]);
+    props.push(['flavor', `"${def.flavor || 'balanced'}"`]);
+    props.push(['tapping-term-ms', `<${parseInt(def.tappingTerm) || 200}>`]);
+    props.push(['quick-tap-ms', parseInt(def.quickTap) > 0 ? `<${parseInt(def.quickTap)}>` : null]);
+  } else if (def.type === 'macro') {
+    props.push(['#binding-cells', '<0>']);
+    props.push(['wait-ms', parseInt(def.waitMs) >= 0 && def.waitMs !== '' && def.waitMs != null ? `<${parseInt(def.waitMs)}>` : null]);
+    props.push(['tap-ms', parseInt(def.tapMs) >= 0 && def.tapMs !== '' && def.tapMs != null ? `<${parseInt(def.tapMs)}>` : null]);
+    props.push(['bindings', `<${def.bindings.trim()}>`]);
+  }
+  return props;
+}
+
+/** 自作の動作を追加・更新したテキストを返す */
+export function upsertBehavior(text, def) {
+  const parsed = parseKeymap(text);
+  const props = behaviorProps(def);
+  const existing = parsed.behaviors[def.label];
+  const edits = [];
+  if (existing) {
+    const node = existing.node;
+    const ind = lineIndentAt(text, node.start) + '    ';
+    let insertAt = node.closeBrace;
+    while (insertAt > 0 && (text[insertAt - 1] === ' ' || text[insertAt - 1] === '\t')) insertAt--;
+    let add = '';
+    for (const [name, value] of props) {
+      if (name === 'compatible') continue;
+      const p = node.props[name];
+      if (p && value != null) {
+        if (p.raw !== value) edits.push({ start: p.start, end: p.end, str: ' ' + value });
+      } else if (p && value == null) {
+        let s = p.propStart;
+        while (s > 0 && (text[s - 1] === ' ' || text[s - 1] === '\t')) s--;
+        let e = p.propEnd;
+        if (text[e] === '\n') e++;
+        edits.push({ start: s, end: e, str: '' });
+      } else if (!p && value != null) {
+        add += `${ind}${name} = ${value};\n`;
+      }
+    }
+    if (add) edits.push({ start: insertAt, end: insertAt, str: add });
+  } else {
+    // 入れる場所: behaviors / macros ノード、なければ keymap ノードの直前
+    let container = null;
+    let before = null;
+    const roots = [];
+    const tree = parseTree(parsed.masked);
+    for (const c of tree.children) if (c.name === '/') roots.push(c);
+    const want = def.type === 'macro' ? ['macros', 'behaviors'] : ['behaviors'];
+    for (const w of want) {
+      for (const r of roots) { const n = r.children.find((c) => c.name === w); if (n) { container = n; break; } }
+      if (container) break;
+    }
+    if (!container) {
+      const km = parsed.keymapNode;
+      before = km;
+    }
+    const nodeText = (ind) => `${ind}${def.label}: ${def.label} {\n${props.filter(([, v]) => v != null).map(([n, v]) => `${ind}    ${n} = ${v};`).join('\n')}\n${ind}};\n`;
+    if (container) {
+      const ind = lineIndentAt(text, container.start) + '    ';
+      let pos = container.closeBrace;
+      while (pos > 0 && (text[pos - 1] === ' ' || text[pos - 1] === '\t')) pos--;
+      const needNl = text[pos - 1] !== '\n';
+      edits.push({ start: pos, end: pos, str: (needNl ? '\n' : '') + '\n' + nodeText(ind) });
+    } else if (before) {
+      const ind = lineIndentAt(text, before.start);
+      const pos = text.lastIndexOf('\n', before.start - 1) + 1;
+      edits.push({ start: pos, end: pos, str: nodeText(ind) + '\n' });
+    } else {
+      throw new Error('動作を追加する場所（/ { ... }）が見つかりません');
+    }
+  }
+  edits.sort((a, b) => b.start - a.start);
+  let out = text;
+  for (const e of edits) out = out.slice(0, e.start) + e.str + out.slice(e.end);
+  return out;
+}
+
+/** 自作の動作を削除したテキストを返す */
+export function removeBehavior(text, label) {
+  const parsed = parseKeymap(text);
+  const b = parsed.behaviors[label];
+  if (!b) return text;
+  let s = b.node.start;
+  while (s > 0 && (text[s - 1] === ' ' || text[s - 1] === '\t')) s--;
+  let e = b.node.end;
+  if (text[e] === '\n') e++;
+  return text.slice(0, s) + text.slice(e);
+}
+
+/** その動作を使っている場所 */
+export function behaviorUsages(parsed, layers, label) {
+  const out = [];
+  layers.forEach((L, li) => L.bindings.forEach((b, pos) => { if (b.behavior === label) out.push({ layer: li, pos }); }));
+  for (const other of Object.values(parsed.behaviors)) {
+    if (other.label !== label && other.bindings.some((b) => b.behavior === label)) out.push({ behavior: other.label });
+  }
+  if (new RegExp(`&${label}\\b`).test(parsed.masked.slice(0, parsed.keymapNode?.start ?? 0).replace(/^[ \t]*#.*$/gm, '')) && !out.length) {
+    // combos などからの参照
+    out.push({ other: true });
+  }
+  return out;
 }
