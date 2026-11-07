@@ -1,7 +1,9 @@
 import {
   parseKeymap, serializeKeymap, bindingToString, parseBindingString, templateKeymap, expandDefines,
 } from './dts.js';
-import { ZONKEY_LAYOUT, ROW_SIZES, TRACKBALL, PC_KEYMAP, pcKeyLabel, positionName, layoutBounds } from './layout.js';
+import { ZONKEY_LAYOUT, ROW_SIZES, TRACKBALL, ENCODERS, PC_KEYMAP, pcKeyLabel, positionName, layoutBounds } from './layout.js';
+import { describeSensor } from './describe.js';
+import { parseSensorBindings, sensorBindingsToString } from './dts.js';
 import {
   KEYS, CATEGORIES, parseKeyExpr, keyLabel, charTable, keyByCode, MOD_FUNCS, MOD_USAGE_BIT, isShiftedAlias,
 } from './keycodes.js';
@@ -64,6 +66,7 @@ const state = {
   layers: [], // { origIndex, displayName, bindings, sensorBindings }
   current: 0,
   selected: null,
+  selectedEnc: null,
   mode: 'edit',
   host: 'jis',
   history: [],
@@ -292,6 +295,7 @@ function renderBoard() {
   }, state.mode === 'sim' ? (snap?.mouseActive ? '操作中' : 'トラック\nボール') : '');
   tb.style.whiteSpace = 'pre';
   board.append(tb);
+  ENCODERS.forEach((enc, ei) => board.append(renderEncoderKnob(enc, ei, view, u, offY)));
 
   ZONKEY_LAYOUT.forEach((k, pos) => {
     let binding, fromLayer;
@@ -373,7 +377,7 @@ function renderBoard() {
 
   const hint = $('boardHint');
   hint.textContent = {
-    edit: 'キーをクリックして編集。ドラッグで入れ替え（Alt/Ctrl を押しながらでコピー）。Delete で透過、Ctrl+C / Ctrl+V でコピー＆貼り付け。',
+    edit: 'キーやエンコーダー（丸いつまみ）をクリックして編集。ドラッグで入れ替え（Alt/Ctrl を押しながらでコピー）。Delete で透過、Ctrl+C / Ctrl+V でコピー＆貼り付け。',
     sim: 'キーを押す（クリック / タッチ / PC のキーボード）と、PC に何が送られるかを確認できます。タッチ画面なら同時押しもできます。',
     test: 'Zonkey を接続してキーを押すと、届いたキーに ✓ が付きます。薄いキーはレイヤー切替などで、PC に信号を送らないため対象外です。',
     code: '',
@@ -486,7 +490,9 @@ function renderEditPanel() {
   const right = h('div');
   panel.append(h('div', { class: 'grid2' }, left, right));
 
-  if (pos == null) {
+  if (state.selectedEnc != null) {
+    renderEncoderEditor(left, right, state.selectedEnc);
+  } else if (pos == null) {
     left.append(
       h('h2', {}, 'キーを選んでください'),
       h('p', { class: 'muted' }, '上のキーボードでキーをクリックすると、ここで動作を変えられます。'),
@@ -764,6 +770,7 @@ let captureUpHandler = null;
 
 function selectKey(pos) {
   state.selected = pos;
+  state.selectedEnc = null;
   const b = state.layers[state.current]?.bindings[pos];
   const kp = b && behaviorKeyParam(b);
   const p = kp && parseKeyExpr(expandDefines(kp, state.parsed?.defines));
@@ -843,7 +850,10 @@ function renderSimPanel() {
     h('label', { class: 'toggle' }, pcCb, 'PC のキーボードで押す（キーに割り当てを表示）'),
     h('label', { class: 'toggle' }, latchCb, 'クリックで押しっぱなしにする（もう一度クリックで離す）'),
     h('div', { class: 'row', style: { marginTop: '6px' } }, mouseBtn),
-    h('p', { class: 'muted', style: { fontSize: '12px' } }, '右クリックでも、そのキーだけ押しっぱなしにできます。長押し判定は実機と同じ時間で行います。'),
+    ENCODERS.length ? h('div', { class: 'row', style: { marginTop: '6px' } }, 'エンコーダー:',
+      h('button', { onclick: () => rotateEncoder(0, -1) }, '↺ 反時計回り'),
+      h('button', { onclick: () => rotateEncoder(0, 1) }, '↻ 時計回り')) : null,
+    h('p', { class: 'muted', style: { fontSize: '12px' } }, '右クリックでも、そのキーだけ押しっぱなしにできます。長押し判定は実機と同じ時間で行います。エンコーダーはつまみの上でマウスホイールを回しても試せます。'),
     h('h3', {}, '動作ログ'),
     h('ul', { id: 'simLog', class: 'log' }),
   );
@@ -1879,6 +1889,220 @@ function parseModMaskBits(str) {
   return m;
 }
 
+// ---------------------------------------------------------------- エンコーダー
+
+function sensorList(layerIdx) {
+  return parseSensorBindings(state.layers[layerIdx]?.sensorBindings);
+}
+
+/** 透過を解決して、そのレイヤーで実際に使われるエンコーダーの設定 */
+function effectiveSensor(layerIdx, ei) {
+  for (let l = layerIdx; l >= 0; l--) {
+    const b = sensorList(l)[ei];
+    if (b && b.behavior !== 'trans' && b.behavior !== 'none') return { binding: b, layer: l };
+  }
+  return { binding: null, layer: 0 };
+}
+
+function shortLabel(s) {
+  const t = String(s || '').replace('スクロール', '🖱');
+  return [...t].length > 6 ? [...t].slice(0, 6).join('') + '…' : t;
+}
+
+function renderEncoderKnob(enc, ei, view, u, offY) {
+  const own = sensorList(view)[ei];
+  let shown = own;
+  let from = view;
+  if (state.mode === 'sim' && state.sim.viewLayer == null) {
+    const act = sim.activeLayers();
+    shown = null;
+    for (let i = act.length - 1; i >= 0; i--) {
+      const b = sensorList(act[i])[ei];
+      if (b && b.behavior !== 'trans' && b.behavior !== 'none') { shown = b; from = act[i]; break; }
+    }
+  } else if (!own || own.behavior === 'trans' || own.behavior === 'none') {
+    const eff = effectiveSensor(view - 1, ei);
+    shown = eff.binding;
+    from = eff.layer;
+  }
+  const d = describeSensor(shown, ctx());
+  const isTrans = state.mode !== 'sim' && (!own || own.behavior === 'trans') && view > 0;
+  const knob = h('div', {
+    class: 'encoder' + (state.selectedEnc === ei && state.mode === 'edit' ? ' selected' : '') + (isTrans ? ' trans' : ''),
+    style: {
+      left: (enc.cx - enc.r) * u + 'px', top: (enc.cy - enc.r - offY) * u + 'px',
+      width: enc.r * 2 * u + 'px', height: enc.r * 2 * u + 'px',
+    },
+    title: `${enc.name}\n時計回り: ${d.cw.desc || d.cw.tap}\n反時計回り: ${d.ccw.desc || d.ccw.tap}${isTrans ? `\n（L${from} と同じ）` : ''}`
+      + (state.mode === 'sim' ? '\nクリック: 時計回り / 右クリック: 反時計回り / ホイールでも回せます' : state.mode === 'edit' ? '\nクリックで編集' : ''),
+  },
+  h('span', { class: 'enc-cw' }, '↻' + shortLabel(d.cw.tap)),
+  h('span', { class: 'enc-ccw' }, '↺' + shortLabel(d.ccw.tap)));
+  knob.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+    if (state.mode === 'edit') {
+      state.selectedEnc = ei;
+      state.selected = null;
+      renderBoard();
+      renderEditPanel();
+    } else if (state.mode === 'sim') {
+      e.preventDefault();
+      rotateEncoder(ei, e.button === 2 ? -1 : 1);
+    }
+  });
+  knob.addEventListener('contextmenu', (e) => e.preventDefault());
+  knob.addEventListener('wheel', (e) => {
+    if (state.mode !== 'sim') return;
+    e.preventDefault();
+    rotateEncoder(ei, e.deltaY > 0 ? 1 : -1);
+  }, { passive: false });
+  return knob;
+}
+
+function rotateEncoder(ei, dir) {
+  sim.rotate(ei, dir, state.layers.map((l) => parseSensorBindings(l.sensorBindings)));
+}
+
+/** エンコーダー ei の設定を変える（layers: 対象レイヤー番号の配列） */
+function setSensor(ei, binding, layers = [state.current]) {
+  commit(() => {
+    for (const li of layers) {
+      const list = sensorList(li);
+      while (list.length < ei) list.push({ behavior: 'trans', params: [] });
+      list[ei] = binding;
+      // 末尾の未設定を詰める
+      state.layers[li].sensorBindings = sensorBindingsToString(list);
+    }
+  }, { noPush: true });
+}
+
+/** 時計回り / 反時計回りの binding を持つ sensor-rotate 動作を探す（なければ作る） */
+function ensureRotateBehavior(cw, ccw, baseName) {
+  const found = Object.values(state.parsed.behaviors).find((c) => c.compatible === 'zmk,behavior-sensor-rotate'
+    && c.bindings.length >= 2 && bindingToString(c.bindings[0]) === cw && bindingToString(c.bindings[1]) === ccw);
+  if (found) return found.label;
+  let label = baseName;
+  let n = 2;
+  while (state.parsed.behaviors[label] || validateBehaviorLabel(label, state.parsed)) label = `${baseName}${n++}`;
+  applyTextChange(upsertBehavior(output(), { type: 'sensor-rotate', label, cw, ccw, tapMs: 20 }));
+  return label;
+}
+
+function encoderPresets() {
+  const jis = state.host === 'jis';
+  return [
+    { id: 'scroll_v', name: 'スクロール（上下）', rotate: ['&msc SCRL_DOWN', '&msc SCRL_UP'], base: 'enc_scroll_v' },
+    { id: 'scroll_h', name: 'スクロール（左右）', rotate: ['&msc SCRL_RIGHT', '&msc SCRL_LEFT'], base: 'enc_scroll_h' },
+    { id: 'vol', name: '音量', keys: ['C_VOL_UP', 'C_VOL_DN'] },
+    { id: 'arrow_v', name: '矢印（上下）', keys: ['DOWN', 'UP'] },
+    { id: 'arrow_h', name: '矢印（左右）', keys: ['RIGHT', 'LEFT'] },
+    { id: 'page', name: 'ページ送り', keys: ['PG_DN', 'PG_UP'] },
+    { id: 'tab', name: 'タブ切り替え', keys: ['LC(TAB)', 'LC(LS(TAB))'] },
+    { id: 'zoom', name: 'ズーム', keys: [jis ? 'LC(SEMI)' : 'LC(EQUAL)', 'LC(MINUS)'] },
+    { id: 'undo', name: 'やり直し / 元に戻す', keys: ['LC(Y)', 'LC(Z)'] },
+    { id: 'bright', name: '画面の明るさ', keys: ['C_BRI_UP', 'C_BRI_DN'] },
+    { id: 'media', name: '曲送り / 曲戻し', keys: ['C_NEXT', 'C_PREV'] },
+  ];
+}
+
+function presetBinding(p) {
+  if (p.keys) return { behavior: 'inc_dec_kp', params: [...p.keys] };
+  return null;
+}
+
+function bindingMatchesPreset(b, p) {
+  if (!b) return false;
+  if (p.keys) return b.behavior === 'inc_dec_kp' && b.params[0] === p.keys[0] && b.params[1] === p.keys[1];
+  const c = state.parsed.behaviors[b.behavior];
+  return !!c && c.compatible === 'zmk,behavior-sensor-rotate' && c.bindings.length >= 2
+    && bindingToString(c.bindings[0]) === p.rotate[0] && bindingToString(c.bindings[1]) === p.rotate[1];
+}
+
+function renderEncoderEditor(left, right, ei) {
+  const enc = ENCODERS[ei];
+  const L = state.current;
+  const own = sensorList(L)[ei] || null;
+  const eff = (!own || own.behavior === 'trans') && L > 0 ? effectiveSensor(L - 1, ei) : { binding: own, layer: L };
+  const d = describeSensor(own, ctx());
+  const de = describeSensor(eff.binding, ctx());
+  const allLayers = state.layers.map((_, i) => i);
+
+  const apply = (b) => setSensor(ei, b);
+  const applyPreset = (p, layers = [L]) => {
+    if (p.keys) { setSensor(ei, presetBinding(p), layers); return; }
+    const label = ensureRotateBehavior(p.rotate[0], p.rotate[1], p.base);
+    setSensor(ei, { behavior: label, params: [] }, layers);
+  };
+
+  left.append(
+    h('h2', {}, `🎛 ${enc.name} ・ レイヤー${L}`),
+    h('div', { class: 'desc' },
+      h('div', {}, '↻ 時計回り: ', h('b', {}, de.cw.desc || de.cw.tap)),
+      h('div', {}, '↺ 反時計回り: ', h('b', {}, de.ccw.desc || de.ccw.tap)),
+      (!own || own.behavior === 'trans') && L > 0 ? h('div', { class: 'muted' }, `このレイヤーは透過なので、レイヤー${eff.layer} の設定が使われます。`) : null,
+      d.kind === 'unknown' ? h('div', { class: 'warn-text' }, '「コード」欄で直接設定された動作です。') : null,
+    ),
+  );
+
+  const codeIn = h('input', { type: 'text', class: 'code-input', value: own ? bindingToString(own) : '', placeholder: '例: &inc_dec_kp C_VOL_UP C_VOL_DN', spellcheck: false });
+  const applyCode = () => {
+    const v = codeIn.value.trim();
+    if (!v) { apply(null); return; }
+    const b = parseBindingString(v);
+    if (!b) { toast('「&」で始まる ZMK のコードを入力してください'); return; }
+    apply(b);
+  };
+  codeIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyCode(); });
+  left.append(h('h3', {}, 'ZMK のコード（直接編集もできます）'), h('div', { class: 'row' }, codeIn, h('button', { onclick: applyCode }, '適用')));
+
+  const presets = encoderPresets();
+  const grid = h('div', { class: 'behaviors' });
+  for (const p of presets) {
+    grid.append(h('button', { class: bindingMatchesPreset(own, p) ? 'active' : '', onclick: () => applyPreset(p) }, p.name));
+  }
+  grid.append(
+    h('button', { class: own?.behavior === 'trans' ? 'active' : '', disabled: L === 0, title: L === 0 ? 'レイヤー0 では使えません' : '', onclick: () => apply({ behavior: 'trans', params: [] }) }, '透過 ▽'),
+  );
+  left.append(h('h3', {}, 'よく使う設定'), grid);
+
+  const canSwap = own && (own.behavior === 'inc_dec_kp' || state.parsed.behaviors[own.behavior]?.compatible === 'zmk,behavior-sensor-rotate');
+  left.append(h('div', { class: 'row', style: { marginTop: '12px' } },
+    h('button', {
+      disabled: !canSwap, title: '時計回りと反時計回りを入れ替えます',
+      onclick: () => {
+        if (own.behavior === 'inc_dec_kp') { apply({ behavior: 'inc_dec_kp', params: [own.params[1], own.params[0]] }); return; }
+        const c = state.parsed.behaviors[own.behavior];
+        const label = ensureRotateBehavior(bindingToString(c.bindings[1]), bindingToString(c.bindings[0]), `${own.behavior}_rev`.slice(0, 20));
+        setSensor(ei, { behavior: label, params: [] });
+      },
+    }, '⇄ 回す向きを逆にする'),
+    h('button', {
+      disabled: !own, onclick: () => {
+        if (!confirm(`すべてのレイヤーのエンコーダーを「${bindingToString(own)}」にしますか？`)) return;
+        setSensor(ei, own, allLayers);
+        toast('すべてのレイヤーに設定しました');
+      },
+    }, '全レイヤーに同じ設定'),
+  ));
+
+  left.append(h('div', { class: 'note', style: { marginTop: '12px', fontSize: '12px' } },
+    'エンコーダーの設定は「本体に接続」（ZMK Studio）では書き込めません。「💾 保存」で GitHub に保存し、ビルドされたファームを右手側に書き込むと反映されます（キーマップは右手側に入っています）。',
+    ' 回す向きが逆に感じたら「回す向きを逆にする」を押してください。'));
+
+  // 自分で選ぶ（時計回り / 反時計回り）
+  const cwKey = own?.behavior === 'inc_dec_kp' ? own.params[0] : null;
+  const ccwKey = own?.behavior === 'inc_dec_kp' ? own.params[1] : null;
+  right.append(
+    h('h2', {}, '自分でキーを選ぶ'),
+    h('p', { class: 'muted', style: { fontSize: '12px' } }, '回すたびに、選んだキーが 1 回押されます（&inc_dec_kp）。'),
+    h('h3', {}, '↻ 時計回りに回したとき'),
+    own?.behavior !== 'inc_dec_kp' ? h('p', { class: 'muted', style: { fontSize: '12px' } }, '今はキー以外の設定です。ここで選ぶとキー入力に切り替わります。') : null,
+    keyPicker(cwKey || '', (k) => apply({ behavior: 'inc_dec_kp', params: [k, ccwKey || 'C_VOL_DN'] })),
+    h('h3', {}, '↺ 反時計回りに回したとき'),
+    keyPicker(ccwKey || '', (k) => apply({ behavior: 'inc_dec_kp', params: [cwKey || 'C_VOL_UP', k] })),
+  );
+}
+
 // ---------------------------------------------------------------- モード
 
 function setMode(mode) {
@@ -1925,7 +2149,7 @@ window.addEventListener('keydown', (e) => {
   if (mod && e.key.toLowerCase() === 'c') { state.clipboard = cloneB(L.bindings[pos]); toast('コピーしました'); e.preventDefault(); }
   else if (mod && e.key.toLowerCase() === 'v' && state.clipboard) { setBinding(pos, cloneB(state.clipboard)); e.preventDefault(); }
   else if (e.key === 'Delete' || e.key === 'Backspace') { setBinding(pos, TRANS()); e.preventDefault(); }
-  else if (e.key === 'Escape') { state.selected = null; renderBoard(); renderEditPanel(); }
+  else if (e.key === 'Escape') { state.selected = null; state.selectedEnc = null; renderBoard(); renderEditPanel(); }
   else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft' || e.key === 'ArrowUp' || e.key === 'ArrowDown') {
     e.preventDefault();
     const cur = ZONKEY_LAYOUT[pos];

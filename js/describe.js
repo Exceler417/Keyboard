@@ -101,7 +101,10 @@ export function describeBinding(b, ctx) {
     }
     case 'out': return { tap: ({ OUT_USB: 'USB', OUT_BLE: 'BLE', OUT_TOG: 'USB⇄BLE' })[params[0]] || 'OUT', kind: 'system', desc: '出力先の切り替え', ok: true };
     case 'mkp': { const nm = mouseButtonName(params[0]); return { tap: nm.replace('クリック', ''), hold: 'マウス', kind: 'mouse', desc: `マウスの${nm}`, ok: true }; }
-    case 'msc': return { tap: 'スクロール', kind: 'mouse', desc: `スクロール ${params.join(' ')}`, ok: true };
+    case 'msc': {
+      const dir = { SCRL_UP: '↑', SCRL_DOWN: '↓', SCRL_LEFT: '←', SCRL_RIGHT: '→' }[b.params[0]] || '';
+      return { tap: 'スクロール' + dir, kind: 'mouse', desc: `マウスのスクロール${dir ? `（${dir}）` : ` ${params.join(' ')}`}`, ok: true };
+    }
     case 'mmv': return { tap: 'マウス移動', kind: 'mouse', desc: `マウス移動 ${params.join(' ')}`, ok: true };
     case 'bootloader': return { tap: '書込モード', kind: 'system', desc: 'ブートローダー（ファーム書き込みモード）に入る', ok: true };
     case 'sys_reset': return { tap: '再起動', kind: 'system', desc: 'キーボードを再起動', ok: true };
@@ -151,4 +154,29 @@ export function layerRefs(b, parsed) {
     return custom.bindings.filter((x) => ['mo', 'to', 'tog', 'sl'].includes(x.behavior) && x.params.length).map((x) => parseInt(expandDefines(x.params[0], defines)));
   }
   return [];
+}
+
+/**
+ * エンコーダー（sensor-bindings）の 1 つ分を説明する
+ * 戻り値: { cw: {tap, desc}, ccw: {tap, desc}, kind: 'keys'|'custom'|'trans'|'none'|'unknown', ok }
+ */
+export function describeSensor(b, ctx) {
+  if (!b) return { kind: 'none', cw: { tap: '—', desc: '設定なし' }, ccw: { tap: '—', desc: '設定なし' }, ok: true };
+  if (b.behavior === 'trans') return { kind: 'trans', cw: { tap: '▽', desc: '下のレイヤーと同じ' }, ccw: { tap: '▽', desc: '下のレイヤーと同じ' }, ok: true };
+  if (b.behavior === 'none') return { kind: 'trans', cw: { tap: '▽', desc: '下のレイヤーと同じ（エンコーダーでは &none も透過になる）' }, ccw: { tap: '▽', desc: '下のレイヤーと同じ' }, ok: true };
+  if (b.behavior === 'inc_dec_kp') {
+    const cw = describeBinding({ behavior: 'kp', params: [b.params[0]] }, ctx);
+    const ccw = describeBinding({ behavior: 'kp', params: [b.params[1]] }, ctx);
+    return { kind: 'keys', cw, ccw, ok: cw.ok && ccw.ok };
+  }
+  const c = ctx.parsed?.behaviors?.[b.behavior];
+  if (c && c.compatible === 'zmk,behavior-sensor-rotate' && c.bindings.length >= 2) {
+    return { kind: 'custom', cw: describeBinding(c.bindings[0], ctx), ccw: describeBinding(c.bindings[1], ctx), ok: true };
+  }
+  if (c && c.compatible === 'zmk,behavior-sensor-rotate-var' && c.bindings.length >= 2) {
+    const cw = describeBinding({ ...c.bindings[0], params: [...c.bindings[0].params, b.params[0]].filter((x) => x != null) }, ctx);
+    const ccw = describeBinding({ ...c.bindings[1], params: [...c.bindings[1].params, b.params[1]].filter((x) => x != null) }, ctx);
+    return { kind: 'custom', cw, ccw, ok: true };
+  }
+  return { kind: 'unknown', cw: { tap: '&' + b.behavior, desc: `&${b.behavior} ${b.params.join(' ')}` }, ccw: { tap: '&' + b.behavior, desc: '' }, ok: !!c };
 }

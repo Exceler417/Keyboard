@@ -197,6 +197,17 @@ main { padding: 0 16px 32px; display: grid; grid-template-columns: minmax(0, 1fr
 .mods label { display: flex; align-items: center; gap: 4px; }
 .capture.listening { background: var(--warn); color: #fff; border-color: var(--warn); }
 
+/* エンコーダー */
+.encoder {
+  position: absolute; border-radius: 50%; border: 2px solid var(--key-edge); cursor: pointer; z-index: 1;
+  background: radial-gradient(circle at 40% 35%, var(--key) 0 45%, var(--surface-2) 70%);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+  font-size: calc(var(--u) * .16); line-height: 1.15; color: var(--key-text); overflow: hidden; text-align: center;
+}
+.encoder.trans { border-style: dashed; color: var(--muted); }
+.encoder.selected { box-shadow: 0 0 0 3px var(--accent); }
+.encoder .enc-cw, .encoder .enc-ccw { white-space: nowrap; }
+
 /* 本体接続 */
 .key.diff { box-shadow: 0 0 0 3px var(--accent); }
 .key.diff::before { content: "≠"; position: absolute; top: 1px; left: 4px; font-size: calc(var(--u) * .18); color: var(--accent); font-weight: 700; }

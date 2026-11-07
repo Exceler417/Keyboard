@@ -32,6 +32,11 @@ export const ROW_SIZES = [[5, 5], [6, 6], [6, 6], [6, 3]];
 // トラックボール（右手側）の表示位置。物理配列ファイルには無いので目安。
 export const TRACKBALL = { cx: 11.9, cy: 4.75, r: 0.95 };
 
+// ロータリーエンコーダー（sensors の順）。位置は目安。
+export const ENCODERS = [
+  { name: '左手のエンコーダー', cx: 5.78, cy: 1.48, r: 0.48 },
+];
+
 // シミュレーターで PC のキーボードから押すときの割り当て（event.code）
 // 位置が近いキーを選んでいる。
 export const PC_KEYMAP = [

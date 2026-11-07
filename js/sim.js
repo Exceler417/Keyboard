@@ -432,7 +432,12 @@ export class Simulator {
         chain(() => this.addLog(`マウス ${nm} 離す`, 'mouse'));
         return;
       }
-      case 'msc': this.addLog(`スクロール ${params.join(' ')}`, 'mouse'); return;
+      case 'msc': {
+        const dir = { SCRL_UP: '↑', SCRL_DOWN: '↓', SCRL_LEFT: '←', SCRL_RIGHT: '→' }[b.params[0]] || b.params.join(' ');
+        this.addLog(`マウスのスクロール ${dir}`, 'mouse');
+        this.reports.push({ label: `🖱 スクロール${dir}`, kind: 'mouse' });
+        return;
+      }
       case 'mmv': this.addLog(`マウス移動 ${params.join(' ')}`, 'mouse'); return;
       case 'bootloader': this.addLog('ブートローダーに入る（書き込みモード）', 'system'); return;
       case 'sys_reset': this.addLog('キーボードを再起動', 'system'); return;
@@ -476,6 +481,40 @@ export class Simulator {
     }
     this.addLog(`マクロ ${custom.label} を実行`, 'macro');
     st.release = () => { for (const x of pressedInMacro) x.sub.release && x.sub.release(); };
+  }
+
+  /** エンコーダーを回す（dir: 1 = 時計回り, -1 = 反時計回り） */
+  rotate(index, dir, sensorLayers) {
+    const act = this.activeLayers();
+    let b = null;
+    let layer = 0;
+    for (let i = act.length - 1; i >= 0; i--) {
+      const x = sensorLayers?.[act[i]]?.[index];
+      // ZMK ではエンコーダーの &trans / &none はどちらも下のレイヤーへ素通りする
+      if (x && x.behavior !== 'trans' && x.behavior !== 'none') { b = x; layer = act[i]; break; }
+    }
+    const dirName = dir > 0 ? '時計回り' : '反時計回り';
+    if (!b || b.behavior === 'none') { this.addLog(`エンコーダー${dirName}: 何もしない`, 'info'); this.emit(); return; }
+    const defines = this.parsed?.defines;
+    const st = { release: null };
+    const run = (binding) => {
+      this.execute(binding, -1 - index, st);
+      if (st.release) { const r = st.release; st.release = null; r(); }
+    };
+    if (b.behavior === 'inc_dec_kp') {
+      run({ behavior: 'kp', params: [b.params[dir > 0 ? 0 : 1]] });
+    } else {
+      const c = this.parsed?.behaviors?.[b.behavior];
+      if (c && /sensor-rotate/.test(c.compatible) && c.bindings.length >= 2) {
+        const src = c.bindings[dir > 0 ? 0 : 1];
+        const extra = c.compatible === 'zmk,behavior-sensor-rotate-var' ? [b.params[dir > 0 ? 0 : 1]] : [];
+        run({ behavior: src.behavior, params: [...src.params, ...extra].filter((x) => x != null).map((p) => expandDefines(p, defines)) });
+      } else {
+        this.addLog(`シミュレーター未対応のエンコーダー動作: &${b.behavior}`, 'warn');
+      }
+    }
+    this.addLog(`エンコーダーを${dirName}（L${layer}）`, 'info');
+    this.emit();
   }
 
   decide(kind, byRelease = false, reason = '') {
