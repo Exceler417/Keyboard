@@ -11,6 +11,7 @@ import { describeBinding, flavorJa } from './describe.js';
 import { Simulator, guessMouseLayer } from './sim.js';
 import { lintKeymap } from './lint.js';
 import * as GH from './github.js';
+import { readTrackball, writeTrackball, ballModeForLayer, readConf, writeConf, confChanges, confValue, BALL_CONF } from './ball.js';
 import { StudioDevice, serialSupported, bluetoothSupported, LOCKED } from './studio.js';
 import { matchBehaviors, encodeBinding, decodeBinding, compareKeymaps, sameDevBinding } from './studio-map.js';
 import { upsertBehavior, removeBehavior, behaviorUsages, validateBehaviorLabel, behaviorType } from './dts.js';
@@ -76,6 +77,7 @@ const state = {
   sim: { pcKeys: true, latch: false, viewLayer: null },
   test: { on: false, tested: {}, last: null },
   device: { dev: null, kind: null, match: null, live: true, busy: false, compare: null, connecting: false },
+  ball: { status: 'idle', overlay: null, conf: null, settings: null, saved: null, values: {}, error: '', key: '' },
 };
 
 function layerNames() {
@@ -288,11 +290,11 @@ function renderBoard() {
 
   // トラックボール
   const tb = h('div', {
-    class: 'trackball' + (state.mode === 'sim' ? ' clickable' : '') + (snap?.mouseActive ? ' active' : ''),
+    class: 'trackball' + (state.mode === 'sim' ? ' clickable' : '') + (snap?.mouseActive ? ' active' : '') + (ballModeClass(view)),
     style: { left: (TRACKBALL.cx - TRACKBALL.r) * u + 'px', top: (TRACKBALL.cy - TRACKBALL.r - offY) * u + 'px', width: TRACKBALL.r * 2 * u + 'px', height: TRACKBALL.r * 2 * u + 'px' },
-    title: state.mode === 'sim' ? 'クリックでトラックボール操作の ON / OFF（自動マウスレイヤー）' : 'トラックボール',
-    onclick: () => { if (state.mode === 'sim') sim.setMouseActive(!sim.mouseActive); },
-  }, state.mode === 'sim' ? (snap?.mouseActive ? '操作中' : 'トラック\nボール') : '');
+    title: state.mode === 'sim' ? 'クリックでトラックボールを転がす（スクロールのレイヤーではスクロール、それ以外はオートマウス）' : 'トラックボール',
+    onclick: () => { if (state.mode === 'sim') moveTrackball(); },
+  }, state.mode === 'sim' ? (snap?.mouseActive ? '操作中' : ballLabel(sim.topLayer(), 'トラック\nボール')) : ballLabel(view, ''));
   tb.style.whiteSpace = 'pre';
   board.append(tb);
   ENCODERS.forEach((enc, ei) => board.append(renderEncoderKnob(enc, ei, view, u, offY)));
@@ -472,12 +474,13 @@ const BEHAVIOR_CHOICES = [
 ];
 
 function renderPanel() {
-  ['Edit', 'Sim', 'Test', 'Code', 'Device'].forEach((n) => $('panel' + n).classList.toggle('hidden', state.mode !== n.toLowerCase()));
+  ['Edit', 'Sim', 'Test', 'Code', 'Device', 'Ball'].forEach((n) => $('panel' + n).classList.toggle('hidden', state.mode !== n.toLowerCase()));
   if (state.mode === 'edit') renderEditPanel();
   else if (state.mode === 'sim') renderSimPanel();
   else if (state.mode === 'test') renderTestPanel();
   else if (state.mode === 'code') renderCodePanel();
   else if (state.mode === 'device') renderDevicePanel();
+  else if (state.mode === 'ball') renderBallPanel();
 }
 
 function renderEditPanel() {
@@ -831,7 +834,7 @@ function renderSimPanel() {
   panel.replaceChildren();
   const pcCb = h('input', { type: 'checkbox', checked: state.sim.pcKeys, onchange: (e) => { state.sim.pcKeys = e.target.checked; renderBoard(); } });
   const latchCb = h('input', { type: 'checkbox', checked: state.sim.latch, onchange: (e) => { state.sim.latch = e.target.checked; } });
-  const mouseBtn = h('button', { id: 'simMouseBtn', onclick: () => sim.setMouseActive(!sim.mouseActive) });
+  const mouseBtn = h('button', { id: 'simMouseBtn', onclick: () => moveTrackball() });
   const out = h('textarea', { id: 'simOut', class: 'sim-output', readOnly: true, placeholder: 'ここに入力結果が表示されます' });
   const left = h('div', {},
     h('h2', {}, '入力結果（PC に届く文字）'),
@@ -880,8 +883,12 @@ function updateSimPanel() {
   log.replaceChildren(...s.log.slice(-80).reverse().map((l) => h('li', { class: l.kind }, l.msg)));
   const mb = $('simMouseBtn');
   if (mb) {
-    mb.disabled = state.mouseLayer == null;
-    mb.textContent = state.mouseLayer == null ? '自動マウスレイヤーなし' : (s.mouseActive ? '🖱 トラックボール操作を止める' : `🖱 トラックボールを動かす（L${state.mouseLayer} を有効に）`);
+    const bm = ballModeForLayer(state.ball.settings, s.topLayer);
+    mb.disabled = state.mouseLayer == null && bm === 'move';
+    mb.textContent = s.mouseActive ? '🖱 トラックボール操作を止める'
+      : bm === 'scroll' ? `🖱 トラックボールを転がす（L${s.topLayer} ではスクロール）`
+        : bm === 'snipe' ? `🖱 トラックボールを転がす（L${s.topLayer} では精密モード）`
+          : state.mouseLayer == null ? '自動マウスレイヤーなし' : `🖱 トラックボールを動かす（L${state.mouseLayer} を有効に）`;
     mb.className = s.mouseActive ? 'primary' : '';
   }
 }
@@ -2103,6 +2110,239 @@ function renderEncoderEditor(left, right, ei) {
   );
 }
 
+// ---------------------------------------------------------------- トラックボール
+
+function ballLabel(layer, fallback) {
+  const s = state.ball.settings;
+  if (!s) return fallback;
+  const mode = ballModeForLayer(s, layer);
+  if (mode === 'scroll') return 'スクロール';
+  if (mode === 'snipe') return '精密';
+  if (s.automouseLayer === layer) return 'マウス\nレイヤー';
+  return fallback;
+}
+
+function ballModeClass(layer) {
+  const s = state.ball.settings;
+  if (!s) return '';
+  const mode = ballModeForLayer(s, state.mode === 'sim' ? sim.topLayer() : layer);
+  return mode === 'scroll' ? ' tb-scroll' : mode === 'snipe' ? ' tb-snipe' : '';
+}
+
+/** シミュレーター: トラックボールを転がす */
+function moveTrackball() {
+  if (sim.mouseActive) { sim.setMouseActive(false); return; }
+  const top = sim.topLayer();
+  const mode = ballModeForLayer(state.ball.settings, top);
+  if (mode === 'scroll') {
+    sim.addLog(`トラックボールを転がす → スクロール（L${top} はスクロールのレイヤー）`, 'mouse');
+    sim.reports.push({ label: '🖱 トラックボールでスクロール', kind: 'mouse' });
+    sim.emit();
+    return;
+  }
+  if (mode === 'snipe') {
+    sim.addLog(`トラックボールを転がす → 精密モードでカーソル移動（L${top}）`, 'mouse');
+    sim.reports.push({ label: '🖱 精密モードで移動', kind: 'mouse' });
+    sim.emit();
+    return;
+  }
+  sim.setMouseActive(true);
+}
+
+function ballDirty() {
+  const b = state.ball;
+  if (b.status !== 'ready') return false;
+  return !!(ballFileChanges().length);
+}
+
+function ballRepo() {
+  const o = state.origin;
+  if (o.type !== 'github') return null;
+  return { owner: o.owner, repo: o.repo, branch: o.branch, token: getToken() };
+}
+
+async function loadBallFiles() {
+  const repo = ballRepo();
+  if (!repo) return;
+  const b = state.ball;
+  b.status = 'loading';
+  b.error = '';
+  b.key = `${repo.owner}/${repo.repo}@${repo.branch}`;
+  renderBallPanel();
+  try {
+    const overlays = await GH.findFiles(repo, (p) => p.endsWith('.overlay'));
+    overlays.sort((a, c) => (/_R\.overlay$|right/i.test(c) ? 1 : 0) - (/_R\.overlay$|right/i.test(a) ? 1 : 0));
+    let overlay = null;
+    for (const path of overlays) {
+      const f = await GH.getFile({ ...repo, path });
+      if (readTrackball(f.text).found) { overlay = { path, ...f }; break; }
+    }
+    if (!overlay) throw new Error('トラックボール（pixart,pmw3610）を設定しているファイル（.overlay）が見つかりませんでした。');
+    const base = overlay.path.split('/').pop().replace(/\.overlay$/, '');
+    const confPaths = await GH.findFiles(repo, (p) => p.split('/').pop() === `${base}.conf`);
+    let conf = null;
+    for (const path of confPaths) {
+      const f = await GH.getFile({ ...repo, path });
+      if (/PMW3610/.test(f.text)) { conf = { path, ...f }; break; }
+      if (!conf) conf = { path, ...f };
+    }
+    b.overlay = overlay;
+    b.conf = conf;
+    b.saved = readTrackball(overlay.text);
+    b.settings = JSON.parse(JSON.stringify(b.saved));
+    const cv = readConf(conf?.text || '');
+    b.values = Object.fromEntries(BALL_CONF.map((i) => [i.key, confValue(cv, i)]));
+    b.status = 'ready';
+    if (b.settings.automouseLayer >= 0) { state.mouseLayer = b.settings.automouseLayer; sim.mouseLayer = state.mouseLayer; }
+  } catch (e) {
+    b.status = 'error';
+    b.error = e.message || String(e);
+  }
+  renderBallPanel();
+  renderBoard();
+}
+
+/** 保存が必要なファイル [{path, text}] */
+function ballFileChanges() {
+  const b = state.ball;
+  const files = [];
+  if (!b.overlay) return files;
+  const ov = writeTrackball(b.overlay.text, b.settings);
+  if (ov !== b.overlay.text) files.push({ path: b.overlay.path, text: ov });
+  if (b.conf) {
+    const changes = confChanges(readConf(b.conf.text), b.values);
+    if (Object.keys(changes).length) files.push({ path: b.conf.path, text: writeConf(b.conf.text, changes) });
+  }
+  return files;
+}
+
+async function saveBallFiles(tokenOverride) {
+  const repo = ballRepo();
+  const files = ballFileChanges();
+  if (!repo || !files.length) return;
+  const token = tokenOverride || repo.token;
+  if (!token) { toast('保存には GitHub のトークンが必要です'); return; }
+  const b = state.ball;
+  b.status = 'saving';
+  renderBallPanel();
+  try {
+    const res = await GH.commitFiles({ ...repo, token, files, message: 'トラックボールの設定を変更（Zonkey キーマップ工房）' });
+    b.status = 'ready';
+    toast('GitHub に保存しました。ビルドが始まります。', 4000);
+    await loadBallFiles();
+    const panel = $('panelBall');
+    panel.prepend(h('div', { class: 'desc', style: { marginBottom: '10px' } },
+      '✅ 保存しました。ビルドが終わったら、firmware の zonkey_R を右手側に書き込んでください。 ',
+      h('a', { href: GH.actionsUrl(repo), target: '_blank', rel: 'noopener' }, 'Actions（ビルド状況）を開く'), ' ／ ',
+      h('a', { href: res.commitUrl, target: '_blank', rel: 'noopener' }, 'コミットを見る')));
+  } catch (e) {
+    b.status = 'ready';
+    alert('保存できませんでした:\n' + (e.message || e));
+    renderBallPanel();
+  }
+}
+
+function setLayerBallMode(li, mode) {
+  const s = state.ball.settings;
+  s.scrollLayers = s.scrollLayers.filter((x) => x !== li);
+  s.snipeLayers = s.snipeLayers.filter((x) => x !== li);
+  if (mode === 'scroll') s.scrollLayers.push(li);
+  if (mode === 'snipe') s.snipeLayers.push(li);
+  renderBallPanel();
+  renderBoard();
+}
+
+function renderBallPanel() {
+  const panel = $('panelBall');
+  if (state.mode !== 'ball') return;
+  panel.replaceChildren();
+  const b = state.ball;
+  const repo = ballRepo();
+  panel.append(h('h2', {}, '🖲 トラックボールの設定'));
+  if (!repo) {
+    panel.append(
+      h('p', {}, 'トラックボールの設定は .keymap とは別のファイル（zonkey_R.overlay / zonkey_R.conf）にあるため、GitHub からキーマップを読み込んだときに使えます。'),
+      h('button', { class: 'primary', onclick: openLoadDialog }, '📂 GitHub から読み込む'),
+    );
+    return;
+  }
+  const key = `${repo.owner}/${repo.repo}@${repo.branch}`;
+  if (b.status === 'idle' || (b.key && b.key !== key && b.status !== 'loading')) { loadBallFiles(); return; }
+  if (b.status === 'loading') { panel.append(h('p', { class: 'muted' }, `${repo.owner}/${repo.repo} から設定ファイルを読み込んでいます…`)); return; }
+  if (b.status === 'error') {
+    panel.append(h('p', { class: 'err' }, b.error), h('button', { onclick: loadBallFiles }, 'もう一度読み込む'));
+    return;
+  }
+
+  const s = b.settings;
+  const names = layerNames();
+  const table = h('div', { class: 'ball-layers' });
+  state.layers.forEach((_, li) => {
+    const mode = ballModeForLayer(s, li);
+    const seg = h('div', { class: 'seg' }, [['move', '通常'], ['scroll', 'スクロール'], ['snipe', '精密']].map(([m, label]) =>
+      h('button', { class: mode === m ? 'active' : '', onclick: () => setLayerBallMode(li, m) }, label)));
+    table.append(h('div', { class: 'ball-row' + (li === state.current ? ' current' : '') },
+      h('span', { class: 'ball-name', onclick: () => { state.current = li; renderLayerTabs(); renderBoard(); renderBallPanel(); }, title: 'クリックでそのレイヤーを表示' },
+        h('b', {}, `L${li}`), ` ${names[li]}`, s.automouseLayer === li ? ' 🖱' : ''),
+      seg));
+  });
+
+  const amSel = h('select', {
+    onchange: (e) => {
+      s.automouseLayer = parseInt(e.target.value);
+      state.mouseLayer = s.automouseLayer >= 0 ? s.automouseLayer : null;
+      sim.mouseLayer = state.mouseLayer;
+      renderBallPanel(); renderBoard();
+    },
+  }, h('option', { value: '-1', selected: s.automouseLayer < 0 }, 'なし（オートマウスを使わない）'),
+  state.layers.map((_, li) => h('option', { value: String(li), selected: s.automouseLayer === li }, `L${li} ${names[li]}`)));
+
+  const left = h('div', {},
+    h('h3', {}, 'レイヤーごとのトラックボールの動き'),
+    h('p', { class: 'muted', style: { fontSize: '12px' } }, 'いちばん上の有効なレイヤーで決まります。たとえば「スクロール」にしたレイヤーのキーを長押ししている間、トラックボールを転がすとスクロールになります。'),
+    table,
+    h('h3', {}, 'オートマウス（転がすと自動で有効になるレイヤー）'),
+    amSel,
+    b.saved.ballActions ? h('p', { class: 'muted', style: { fontSize: '12px' } }, `※ ボールアクション（${b.saved.ballActions} 件）が設定されています。これはここでは変更できません。`) : null,
+  );
+
+  const right = h('div', {}, h('h3', {}, '速さ・向き'));
+  if (!b.conf) right.append(h('p', { class: 'warn-text' }, '設定ファイル（.conf）が見つからないため、速さは変更できません。'));
+  for (const item of BALL_CONF) {
+    if (!b.conf) break;
+    if (item.type === 'bool') {
+      const cb = h('input', { type: 'checkbox', checked: !!b.values[item.key] });
+      cb.addEventListener('change', () => { b.values[item.key] = cb.checked; renderBallPanel(); });
+      right.append(h('label', { class: 'toggle', style: { marginBottom: '6px' } }, cb, item.label));
+    } else {
+      const inp = h('input', { type: 'number', min: item.min, max: item.max, step: item.step, value: b.values[item.key], style: { width: '110px' } });
+      inp.addEventListener('change', () => {
+        const v = Math.max(item.min, Math.min(item.max, parseInt(inp.value) || item.def));
+        b.values[item.key] = v;
+        renderBallPanel();
+      });
+      right.append(h('label', { class: 'field', style: { display: 'grid', gap: '2px', marginBottom: '8px' } },
+        h('span', {}, item.label), h('div', { class: 'row' }, inp, h('span', { class: 'muted', style: { fontSize: '12px' } }, item.hint || ''))));
+    }
+  }
+  panel.append(h('div', { class: 'grid2' }, left, right));
+
+  const files = ballFileChanges();
+  const tokenIn = !getToken() ? h('input', { type: 'password', placeholder: 'GitHub のトークン（github_pat_...）', autocomplete: 'off', style: { minWidth: '260px' } }) : null;
+  panel.append(
+    h('div', { class: 'note', style: { marginTop: '12px', fontSize: '12px' } },
+      `読み込んだファイル: ${b.overlay.path}${b.conf ? ' / ' + b.conf.path : ''}。`,
+      'トラックボールの設定は「本体に接続」（ZMK Studio）では書き込めません。保存するとビルドが始まるので、できたファームを右手側に書き込んでください。'),
+    h('div', { class: 'row', style: { marginTop: '10px' } },
+      tokenIn,
+      h('button', { class: 'primary', disabled: !files.length || b.status === 'saving', onclick: () => saveBallFiles(tokenIn?.value.trim()) },
+        b.status === 'saving' ? '保存中…' : `💾 GitHub に保存してビルド${files.length ? `（${files.length} ファイル）` : ''}`),
+      h('button', { disabled: !files.length, onclick: () => { b.status = 'idle'; loadBallFiles(); } }, '変更を取り消す'),
+      h('button', { onclick: () => { b.status = 'idle'; loadBallFiles(); } }, '🔄 読み直す'),
+    ),
+  );
+}
+
 // ---------------------------------------------------------------- モード
 
 function setMode(mode) {
@@ -2181,7 +2421,7 @@ window.addEventListener('blur', () => {
 });
 
 window.addEventListener('beforeunload', (e) => {
-  if ((isDirty() && state.origin.type === 'github') || state.device.dev?.unsaved) { e.preventDefault(); e.returnValue = ''; }
+  if ((isDirty() && state.origin.type === 'github') || state.device.dev?.unsaved || ballDirty()) { e.preventDefault(); e.returnValue = ''; }
 });
 
 // ---------------------------------------------------------------- 起動
