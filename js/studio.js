@@ -14,6 +14,16 @@ const BINDING_ERR = {
 export function serialSupported() { return typeof navigator !== 'undefined' && 'serial' in navigator; }
 export function bluetoothSupported() { return typeof navigator !== 'undefined' && 'bluetooth' in navigator; }
 
+/**
+ * ブラウザから Bluetooth で Studio に接続できる OS か。
+ * ZMK の公式ドキュメントでは、Web アプリの BLE 接続は Linux のみ対応（Windows / Mac は不可）。
+ */
+export function bluetoothStudioSupported() {
+  if (!bluetoothSupported()) return false;
+  const ua = navigator.userAgent || '';
+  return /Linux/.test(ua) && !/Android|CrOS/.test(ua);
+}
+
 export class StudioDevice {
   /** transport: { label, abortController, readable, writable } */
   constructor(transport, { onNotify, onDisconnect } = {}) {

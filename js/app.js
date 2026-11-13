@@ -12,7 +12,7 @@ import { Simulator, guessMouseLayer } from './sim.js';
 import { lintKeymap } from './lint.js';
 import * as GH from './github.js';
 import { readTrackball, writeTrackball, ballModeForLayer, readConf, writeConf, confChanges, confValue, BALL_CONF } from './ball.js';
-import { StudioDevice, serialSupported, bluetoothSupported, LOCKED } from './studio.js';
+import { StudioDevice, serialSupported, bluetoothSupported, bluetoothStudioSupported, LOCKED } from './studio.js';
 import { matchBehaviors, encodeBinding, decodeBinding, compareKeymaps, sameDevBinding } from './studio-map.js';
 import { upsertBehavior, removeBehavior, behaviorUsages, validateBehaviorLabel, behaviorType } from './dts.js';
 
@@ -1391,7 +1391,9 @@ async function connectDevice(kind, makeTransport) {
     state.device.live = !!cmp && cmp.diffs.length === 0;
     toast(`${dev.info?.name || '本体'} に接続しました`);
   } catch (e) {
-    if (!/cancel|キャンセル|No port selected|User cancelled/i.test(String(e?.message || e))) alert('接続できませんでした:\n' + (e?.message || e));
+    if (!/cancel|キャンセル|No port selected|User cancelled/i.test(String(e?.message || e))) {
+      alert('接続できませんでした:\n' + (e?.message || e) + (kind === 'ble' ? '\n\nBluetooth で接続できない場合は、USB で接続してください。' : ''));
+    }
   } finally {
     state.device.connecting = false;
     renderDeviceChip();
@@ -1526,7 +1528,7 @@ function renderDevicePanel() {
   const d = state.device.dev;
   if (!d) {
     const usb = serialSupported();
-    const ble = bluetoothSupported();
+    const ble = bluetoothStudioSupported();
     panel.append(h('div', { class: 'grid2' },
       h('div', {},
         h('h2', {}, '本体（Zonkey）に直接書き込む'),
@@ -1538,15 +1540,17 @@ function renderDevicePanel() {
         ),
         h('div', { class: 'row' },
           h('button', { class: 'primary', disabled: !usb || state.device.connecting, onclick: () => connectDevice('usb') }, state.device.connecting ? '接続中…' : '🔌 USB で接続'),
-          h('button', { disabled: !ble || state.device.connecting, onclick: () => connectDevice('ble'), title: 'Bluetooth 接続（ファームが Bluetooth での Studio 接続に対応している場合）' }, '📶 Bluetooth で接続（試験的）'),
+          ble ? h('button', { disabled: state.device.connecting, onclick: () => connectDevice('ble'), title: 'Bluetooth 接続（Linux の Chrome / Edge のみ）' }, '📶 Bluetooth で接続') : null,
         ),
         !usb ? h('p', { class: 'warn-text' }, 'このブラウザは USB 接続（Web Serial）に対応していません。パソコンの Chrome か Edge で開いてください。') : null,
+        !ble ? h('p', { class: 'muted', style: { fontSize: '12px' } }, 'Bluetooth での接続は、Windows / Mac のブラウザでは使えません（ZMK の制限で、ブラウザからの Bluetooth 接続は Linux のみ対応）。USB で接続してください。Bluetooth で使いたい場合は ZMK Studio のデスクトップアプリ（zmk.studio/download）を使ってください。') : null,
       ),
       h('div', {},
         h('h3', {}, '知っておくこと'),
         h('ul', { class: 'muted', style: { paddingLeft: '18px' } },
           h('li', {}, '本体への変更は「本体に保存」を押すまで仮の状態です（電源を切ると元に戻ります）。'),
           h('li', {}, '本体に保存した内容は GitHub の .keymap には入りません。両方そろえたいときは「💾 保存」で GitHub にも保存してください。'),
+          h('li', {}, h('b', {}, '一度「本体に保存」すると、その後に .keymap を変えてファームを書き込んでも、キーの割り当ては本体に保存した内容のままになります。'), ' .keymap の内容を反映させたいときは、接続して「ファームの初期キーマップに戻す」を押してください（エンコーダーとトラックボールの設定は影響を受けません）。'),
           h('li', {}, 'ファームウェアに入っている動作だけ使えます。新しく作った自作の動作は、GitHub に保存してビルド・書き込みした後に使えるようになります。'),
           h('li', {}, 'エンコーダー（sensor-bindings）は本体からは変更できません。'),
           h('li', {}, 'Zonkey 公式のファームは ZMK Studio 対応済み（右手側・USB）です。'),
@@ -1577,6 +1581,7 @@ function renderDevicePanel() {
       : `アプリと本体で ${cmp.diffs.length} キー違います${cmp.errors.length ? `（ほかに書き込めないキー ${cmp.errors.length}）` : ''}。`,
     cmp.layerCountApp !== cmp.layerCountDev ? h('div', {}, `レイヤー数: アプリ ${cmp.layerCountApp} / 本体 ${cmp.layerCountDev}（本体の空き ${d.keymap.availableLayers}）`) : null,
     d.unsaved ? h('div', { class: 'warn-text' }, '本体に未保存の変更があります。「本体に保存」を押すと、電源を切っても残ります。') : null,
+    h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '4px' } }, '※ 本体に保存した割り当ては、新しいファームを書き込んでも残ります。.keymap の内容に戻すには「ファームの初期キーマップに戻す」を使います。'),
   );
   panel.append(status);
 
