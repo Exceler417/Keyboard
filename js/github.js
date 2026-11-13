@@ -85,3 +85,41 @@ export async function fetchOfficial() {
   if (!res.ok) throw new Error(`公式キーマップを取得できませんでした（${res.status}）`);
   return res.text();
 }
+
+export async function findFiles({ owner, repo, branch, token }, test) {
+  const res = await fetch(`${API}/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`, { headers: headers(token) });
+  if (!res.ok) throw new Error(await explain(res));
+  const data = await res.json();
+  return (data.tree || []).filter((t) => t.type === 'blob' && test(t.path)).map((t) => t.path);
+}
+
+/**
+ * 複数のファイルを 1 つのコミットで保存する（GitHub Actions のビルドも 1 回で済む）
+ * files: [{ path, text }]
+ */
+export async function commitFiles({ owner, repo, branch, token, files, message }) {
+  if (!token) throw new Error('保存するには GitHub のトークンが必要です。');
+  const h = { ...headers(token), 'Content-Type': 'application/json' };
+  const base = `${API}/repos/${owner}/${repo}/git`;
+  const call = async (url, opts = {}) => {
+    const res = await fetch(url, { headers: h, cache: 'no-store', ...opts });
+    if (!res.ok) throw new Error(await explain(res));
+    return res.json();
+  };
+  const ref = await call(`${base}/ref/heads/${encodeURIComponent(branch)}`);
+  const parentSha = ref.object.sha;
+  const parent = await call(`${base}/commits/${parentSha}`);
+  const tree = await call(`${base}/trees`, {
+    method: 'POST',
+    body: JSON.stringify({ base_tree: parent.tree.sha, tree: files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', content: f.text })) }),
+  });
+  const commit = await call(`${base}/commits`, {
+    method: 'POST',
+    body: JSON.stringify({ message, tree: tree.sha, parents: [parentSha] }),
+  });
+  await call(`${base}/refs/heads/${encodeURIComponent(branch)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ sha: commit.sha }),
+  });
+  return { sha: commit.sha, commitUrl: `https://github.com/${owner}/${repo}/commit/${commit.sha}` };
+}

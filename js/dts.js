@@ -526,6 +526,44 @@ function behaviorProps(def) {
   return props;
 }
 
+/**
+ * ノードのプロパティを書き換える編集の一覧を返す
+ * props: [[name, value|null], ...]（null は削除、なければ末尾に追加）
+ */
+export function nodePropEdits(text, node, props) {
+  const edits = [];
+  const ind = lineIndentAt(text, node.start) + '    ';
+  let insertAt = node.closeBrace;
+  while (insertAt > 0 && (text[insertAt - 1] === ' ' || text[insertAt - 1] === '\t')) insertAt--;
+  let add = '';
+  for (const [name, value] of props) {
+    const p = node.props[name];
+    if (p && value != null) {
+      if (p.raw !== value) edits.push({ start: p.start, end: p.end, str: ' ' + value });
+    } else if (p && value == null) {
+      let s = p.propStart;
+      while (s > 0 && (text[s - 1] === ' ' || text[s - 1] === '\t')) s--;
+      let e = p.propEnd;
+      if (text[e] === '\n') e++;
+      edits.push({ start: s, end: e, str: '' });
+    } else if (!p && value != null) {
+      add += `${ind}${name} = ${value};\n`;
+    }
+  }
+  if (add) {
+    const needNl = text[insertAt - 1] !== '\n';
+    edits.push({ start: insertAt, end: insertAt, str: (needNl ? '\n' : '') + add });
+  }
+  return edits;
+}
+
+export function applyEdits(text, edits) {
+  const sorted = [...edits].sort((a, b) => b.start - a.start || b.end - a.end);
+  let out = text;
+  for (const e of sorted) out = out.slice(0, e.start) + e.str + out.slice(e.end);
+  return out;
+}
+
 /** 自作の動作を追加・更新したテキストを返す */
 export function upsertBehavior(text, def) {
   const parsed = parseKeymap(text);
@@ -533,27 +571,7 @@ export function upsertBehavior(text, def) {
   const existing = parsed.behaviors[def.label];
   const edits = [];
   if (existing) {
-    const node = existing.node;
-    const ind = lineIndentAt(text, node.start) + '    ';
-    let insertAt = node.closeBrace;
-    while (insertAt > 0 && (text[insertAt - 1] === ' ' || text[insertAt - 1] === '\t')) insertAt--;
-    let add = '';
-    for (const [name, value] of props) {
-      if (name === 'compatible') continue;
-      const p = node.props[name];
-      if (p && value != null) {
-        if (p.raw !== value) edits.push({ start: p.start, end: p.end, str: ' ' + value });
-      } else if (p && value == null) {
-        let s = p.propStart;
-        while (s > 0 && (text[s - 1] === ' ' || text[s - 1] === '\t')) s--;
-        let e = p.propEnd;
-        if (text[e] === '\n') e++;
-        edits.push({ start: s, end: e, str: '' });
-      } else if (!p && value != null) {
-        add += `${ind}${name} = ${value};\n`;
-      }
-    }
-    if (add) edits.push({ start: insertAt, end: insertAt, str: add });
+    edits.push(...nodePropEdits(text, existing.node, props.filter(([n]) => n !== 'compatible')));
   } else {
     // 入れる場所: behaviors / macros ノード、なければ keymap ノードの直前
     let container = null;
