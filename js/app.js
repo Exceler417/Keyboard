@@ -3,6 +3,7 @@ import {
 } from './dts.js';
 import { ZONKEY_LAYOUT, ROW_SIZES, TRACKBALL, ENCODERS, PC_KEYMAP, pcKeyLabel, positionName, layoutBounds } from './layout.js';
 import { describeSensor } from './describe.js';
+import { layerSvg, legendSvg, layerActivators, customBehaviorRows } from './print.js';
 import { parseSensorBindings, sensorBindingsToString } from './dts.js';
 import {
   KEYS, CATEGORIES, parseKeyExpr, keyLabel, charTable, keyByCode, MOD_FUNCS, MOD_USAGE_BIT, isShiftedAlias,
@@ -2348,6 +2349,125 @@ function renderBallPanel() {
   );
 }
 
+// ---------------------------------------------------------------- PDF 出力
+
+const pdfOpts = { layers: null, perPage: 1, showTrans: true, mono: false, behaviors: true, title: '' };
+
+function sourceText() {
+  const o = state.origin;
+  if (o.type === 'github') return `${o.owner}/${o.repo}（${o.branch}）`;
+  if (o.type === 'official') return 'Zonkey 公式デフォルト';
+  if (o.type === 'file') return o.name;
+  return '';
+}
+
+function buildPrintArea(opts) {
+  const area = $('printArea');
+  area.replaceChildren();
+  const names = layerNames();
+  const ball = state.ball?.settings || null;
+  const date = new Date().toLocaleDateString('ja-JP');
+  const title = opts.title || 'Zonkey キーマップ';
+  const layers = opts.layers.filter((i) => i < state.layers.length);
+  const perPage = opts.perPage === 2 ? 2 : 1;
+  for (let p = 0; p < layers.length; p += perPage) {
+    const page = h('section', { class: 'print-page' + (perPage === 2 ? ' two' : '') });
+    page.append(h('header', { class: 'print-head' },
+      h('div', { class: 'print-title' }, title),
+      h('div', { class: 'print-meta' }, [sourceText(), date, `PC の配列: ${state.host === 'jis' ? 'JIS' : 'US'}`].filter(Boolean).join(' ・ '))));
+    for (const li of layers.slice(p, p + perPage)) {
+      const acts = li === 0 ? ['いつも有効（基本のレイヤー）'] : layerActivators(state.layers, li, state.parsed, names);
+      if (ball && ball.automouseLayer === li) acts.push('トラックボールを動かすと自動で有効（オートマウス）');
+      const block = h('div', { class: 'print-layer' },
+        h('h2', {}, `レイヤー${li}`, names[li] ? `「${names[li]}」` : ''),
+        h('div', { class: 'print-acts' }, '入り方: ', acts.length ? acts.join(' ／ ') : '（このレイヤーに切り替えるキーがありません）',
+        ball && ballModeForLayer(ball, li) !== 'move' ? `　トラックボール: ${ballModeForLayer(ball, li) === 'scroll' ? 'スクロール' : '精密モード'}` : ''));
+      const svgHolder = h('div', { class: 'print-svg-wrap' });
+      svgHolder.innerHTML = layerSvg({
+        layers: state.layers, parsed: state.parsed, host: state.host, names, layerIdx: li,
+        mono: opts.mono, showTrans: opts.showTrans, ball, mouseLayer: state.mouseLayer,
+      });
+      block.append(svgHolder);
+      page.append(block);
+    }
+    const legend = h('div', { class: 'print-legend-wrap' });
+    legend.innerHTML = legendSvg(opts.mono);
+    page.append(legend, h('footer', { class: 'print-foot' }, '右上の「⇧」は Shift と一緒に押したとき、キーの下の小さい文字は長押ししたときの動きです。', opts.showTrans ? ' 点線のキーは透過で、薄い文字は下のレイヤーの内容です。' : ''));
+    area.append(page);
+  }
+  if (opts.behaviors) {
+    const rows = customBehaviorRows(state.parsed, state.host, names);
+    if (rows.length) {
+      const page = h('section', { class: 'print-page auto' });
+      page.append(h('header', { class: 'print-head' }, h('div', { class: 'print-title' }, title), h('div', { class: 'print-meta' }, '自作の動作')));
+      page.append(h('table', { class: 'print-table' },
+        h('thead', {}, h('tr', {}, h('th', {}, '名前'), h('th', {}, '動き'))),
+        h('tbody', {}, rows.map((r) => h('tr', {}, h('td', {}, r.name), h('td', {}, r.desc))))));
+      area.append(page);
+    }
+  }
+  $('printPageStyle').textContent = `@page { size: A4 ${perPage === 2 ? 'portrait' : 'landscape'}; margin: 10mm; }`;
+}
+
+function printPdf(opts) {
+  buildPrintArea(opts);
+  document.body.classList.add('printing');
+  const done = () => { document.body.classList.remove('printing'); window.removeEventListener('afterprint', done); };
+  window.addEventListener('afterprint', done);
+  setTimeout(() => window.print(), 50);
+}
+
+function openPdfDialog() {
+  if (!state.parsed) return;
+  if (!pdfOpts.layers) pdfOpts.layers = state.layers.map((_, i) => i);
+  // トラックボールの設定（スクロールのレイヤーなど）も PDF に載せるため、まだなら読み込んでおく
+  if (state.origin.type === 'github' && state.ball.status === 'idle') loadBallFiles();
+  pdfOpts.layers = pdfOpts.layers.filter((i) => i < state.layers.length);
+  const names = layerNames();
+  openDialog((form, close) => {
+    const layerBoxes = h('div', { class: 'mods' }, state.layers.map((_, li) => {
+      const cb = h('input', { type: 'checkbox', checked: pdfOpts.layers.includes(li) });
+      cb.addEventListener('change', () => {
+        pdfOpts.layers = cb.checked ? [...new Set([...pdfOpts.layers, li])].sort((a, b) => a - b) : pdfOpts.layers.filter((x) => x !== li);
+      });
+      return h('label', {}, cb, `L${li} ${names[li]}`);
+    }));
+    const titleIn = h('input', { type: 'text', value: pdfOpts.title, placeholder: 'Zonkey キーマップ' });
+    const perSel = h('select', {},
+      h('option', { value: '1', selected: pdfOpts.perPage === 1 }, '1 ページに 1 レイヤー（A4 横）'),
+      h('option', { value: '2', selected: pdfOpts.perPage === 2 }, '1 ページに 2 レイヤー（A4 縦）'));
+    const chk = (key, label) => {
+      const cb = h('input', { type: 'checkbox', checked: !!pdfOpts[key] });
+      cb.addEventListener('change', () => { pdfOpts[key] = cb.checked; });
+      return h('label', { class: 'toggle' }, cb, label);
+    };
+    const err = h('div', { class: 'err' });
+    form.append(
+      h('h2', {}, '📄 キーマップを PDF に出力'),
+      h('label', { class: 'field' }, h('span', {}, 'タイトル'), titleIn),
+      h('div', { class: 'field' }, h('span', {}, '出力するレイヤー'), layerBoxes),
+      h('label', { class: 'field' }, h('span', {}, 'レイアウト'), perSel),
+      chk('showTrans', '透過キーに、下のレイヤーの内容を薄く表示する'),
+      chk('mono', '白黒で出力する（色を使わない）'),
+      chk('behaviors', '最後のページに自作の動作の一覧を付ける'),
+      h('div', { class: 'note' }, '「PDF を作成」を押すと印刷画面が開きます。送信先（プリンター）を「PDF に保存」にして保存してください。スマホでは、共有メニューから PDF として保存できます。'),
+      err,
+      h('div', { class: 'footer' },
+        h('button', { onclick: close }, '閉じる'),
+        h('button', {
+          class: 'primary', onclick: (e) => {
+            e.preventDefault();
+            if (!pdfOpts.layers.length) { err.textContent = 'レイヤーを 1 つ以上選んでください'; return; }
+            pdfOpts.title = titleIn.value.trim();
+            pdfOpts.perPage = parseInt(perSel.value);
+            close();
+            printPdf(pdfOpts);
+          },
+        }, 'PDF を作成')),
+    );
+  });
+}
+
 // ---------------------------------------------------------------- モード
 
 function setMode(mode) {
@@ -2437,6 +2557,7 @@ async function init() {
   $('btnRedo').addEventListener('click', redo);
   $('btnLoad').addEventListener('click', openLoadDialog);
   $('btnSave').addEventListener('click', openSaveDialog);
+  $('btnPdf').addEventListener('click', openPdfDialog);
   $('deviceChip').addEventListener('click', () => setMode('device'));
   $('hostSelect').addEventListener('change', (e) => { state.host = e.target.value; sim.setHost(state.host); changed(); });
   setupBoardPointer();
@@ -2473,5 +2594,5 @@ async function init() {
 init();
 
 // テストやデバッグ用
-window.__zonkey = { state, sim, output, setBase, connectDevice };
+window.__zonkey = { state, sim, output, setBase, connectDevice, buildPrintArea };
 void flavorJa;

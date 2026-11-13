@@ -289,3 +289,31 @@ dialog .err { color: var(--danger); font-size: 13px; }
   .modes { padding: 8px 8px 0; }
   .actions button { padding: 5px 8px; font-size: 13px; }
 }
+
+/* ---------- 印刷・PDF ---------- */
+#printArea { display: none; }
+@media print {
+  :root { color-scheme: light; }
+  body { background: #fff !important; color: #1d2230; }
+  body > *:not(#printArea) { display: none !important; }
+  #printArea { display: block !important; }
+  .print-page { break-after: page; page-break-after: always; display: flex; flex-direction: column; gap: 6mm; height: 188mm; }
+  .print-page.two { height: 275mm; }
+  .print-page.auto { height: auto; display: block; }
+  .print-page.auto .print-head { margin-bottom: 4mm; }
+  .print-page:last-child { break-after: auto; page-break-after: auto; }
+  .print-head { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1.5px solid #1d2230; padding-bottom: 2mm; }
+  .print-title { font-size: 16pt; font-weight: 700; }
+  .print-meta { font-size: 9pt; color: #555; }
+  .print-layer { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .print-layer h2 { font-size: 14pt; margin: 0 0 1mm; }
+  .print-acts { font-size: 9.5pt; color: #444; margin-bottom: 2mm; }
+  .print-svg-wrap { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+  .print-svg-wrap svg { width: 100%; height: 100%; max-height: 100%; }
+  .print-legend-wrap svg { width: 100%; height: auto; max-height: 14mm; }
+  .print-foot { font-size: 8.5pt; color: #555; }
+  .print-table { width: 100%; border-collapse: collapse; font-size: 10pt; }
+  .print-table th, .print-table td { border: 1px solid #bbb; padding: 2mm 3mm; text-align: left; vertical-align: top; }
+  .print-table th { background: #eef0f5; }
+  .print-table td:first-child { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: nowrap; }
+}
