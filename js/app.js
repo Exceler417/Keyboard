@@ -4,6 +4,7 @@ import {
 import { ZONKEY_LAYOUT, ROW_SIZES, TRACKBALL, ENCODERS, PC_KEYMAP, pcKeyLabel, positionName, layoutBounds } from './layout.js';
 import { describeSensor } from './describe.js';
 import { layerSvg, legendSvg, layerActivators, customBehaviorRows } from './print.js';
+import { startIconObserver } from './icons.js';
 import { parseSensorBindings, sensorBindingsToString } from './dts.js';
 import {
   KEYS, CATEGORIES, parseKeyExpr, keyLabel, charTable, keyByCode, MOD_FUNCS, MOD_USAGE_BIT, isShiftedAlias,
@@ -1294,7 +1295,7 @@ function openSaveDialog() {
 
     form.append(h('h3', {}, 'GitHub にコミット（自動でファームウェアのビルドが始まります）'));
     const gh = githubForm(err, close, 'save');
-    const msgIn = h('input', { type: 'text', value: 'キーマップを更新（Zonkey キーマップ工房）' });
+    const msgIn = h('input', { type: 'text', value: 'キーマップを更新（Zonkey Remap）' });
     const commitBtn = h('button', {
       class: 'primary', onclick: async (e) => {
         e.preventDefault(); err.textContent = '';
@@ -2232,7 +2233,7 @@ async function saveBallFiles(tokenOverride) {
   b.status = 'saving';
   renderBallPanel();
   try {
-    const res = await GH.commitFiles({ ...repo, token, files, message: 'トラックボールの設定を変更（Zonkey キーマップ工房）' });
+    const res = await GH.commitFiles({ ...repo, token, files, message: 'トラックボールの設定を変更（Zonkey Remap）' });
     b.status = 'ready';
     toast('GitHub に保存しました。ビルドが始まります。', 4000);
     await loadBallFiles();
@@ -2468,6 +2469,48 @@ function openPdfDialog() {
   });
 }
 
+// ---------------------------------------------------------------- 表示設定（テーマ）
+
+const LOOK_KEY = 'zonkey-kobo:look';
+const PALETTES = [
+  { id: 'graphite', name: 'グラファイト', desc: '落ち着いたグレーと藍色', colors: ['#f6f7f9', '#ffffff', '#101828', '#4f46e5'] },
+  { id: 'sumi', name: '墨', desc: '和紙のような白と朱色', colors: ['#f5f2ec', '#fffdf9', '#1c1917', '#c2410c'] },
+  { id: 'matcha', name: '抹茶', desc: 'すっきりした白と深い緑', colors: ['#f4f7f5', '#ffffff', '#0f1a14', '#0f766e'] },
+];
+
+function getLook() { return { palette: 'graphite', mode: 'auto', ...(store.get(LOOK_KEY) || {}) }; }
+
+function applyLook(look) {
+  const root = document.documentElement;
+  if (look.palette && look.palette !== 'graphite') root.dataset.palette = look.palette; else delete root.dataset.palette;
+  if (look.mode === 'light' || look.mode === 'dark') root.dataset.theme = look.mode; else delete root.dataset.theme;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = getComputedStyle(root).getPropertyValue('--surface').trim() || '#ffffff';
+  store.set(LOOK_KEY, look);
+}
+
+function openLookDialog() {
+  openDialog((form, close) => {
+    const look = getLook();
+    const draw = () => {
+      form.replaceChildren(
+        h('h2', {}, 'テーマ'),
+        h('div', { class: 'look-grid' }, PALETTES.map((p) => h('button', {
+          class: 'look-card' + (look.palette === p.id ? ' active' : ''),
+          onclick: (e) => { e.preventDefault(); look.palette = p.id; applyLook(look); draw(); },
+        },
+        h('span', { class: 'swatch', style: { background: p.colors[0] } }, p.colors.slice(1).map((c) => h('i', { style: { background: c } }))),
+        h('b', {}, p.name), h('small', {}, p.desc)))),
+        h('h3', {}, '明るさ'),
+        h('div', { class: 'seg', style: { justifySelf: 'start' } }, [['auto', 'OS に合わせる'], ['light', 'ライト'], ['dark', 'ダーク']].map(([m, label]) =>
+          h('button', { class: look.mode === m ? 'active' : '', onclick: (e) => { e.preventDefault(); look.mode = m; applyLook(look); draw(); } }, label))),
+        h('div', { class: 'footer' }, h('button', { class: 'primary', onclick: close }, '閉じる')),
+      );
+    };
+    draw();
+  });
+}
+
 // ---------------------------------------------------------------- モード
 
 function setMode(mode) {
@@ -2558,6 +2601,8 @@ async function init() {
   $('btnLoad').addEventListener('click', openLoadDialog);
   $('btnSave').addEventListener('click', openSaveDialog);
   $('btnPdf').addEventListener('click', openPdfDialog);
+  $('btnLook').addEventListener('click', openLookDialog);
+  startIconObserver();
   $('deviceChip').addEventListener('click', () => setMode('device'));
   $('hostSelect').addEventListener('change', (e) => { state.host = e.target.value; sim.setHost(state.host); changed(); });
   setupBoardPointer();

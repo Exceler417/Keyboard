@@ -3,38 +3,79 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Zonkey キーマップ工房</title>
-  <meta name="description" content="自作キーボード Zonkey（ZMK）のキーマップを日本語で編集・テストできるツール">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='2' y='6' width='28' height='20' rx='4' fill='%233b6fd8'/><rect x='6' y='10' width='5' height='5' rx='1' fill='white'/><rect x='13' y='10' width='5' height='5' rx='1' fill='white'/><rect x='20' y='10' width='5' height='5' rx='1' fill='white'/><rect x='8' y='17' width='16' height='5' rx='1' fill='white'/></svg>">
-  <link rel="stylesheet" href="css/style.css">
+  <title>Zonkey Remap</title>
+  <meta name="description" content="Zonkey Remap — 自作キーボード Zonkey（ZMK）のキーマップを日本語で編集・テストできるツール">
+  <meta name="theme-color" content="#f6f7f9">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><rect x='7' y='9' width='5' height='5' rx='1.4' fill='white'/><rect x='13.5' y='9' width='5' height='5' rx='1.4' fill='white'/><rect x='20' y='9' width='5' height='5' rx='1.4' fill='white' opacity='.55'/><rect x='7' y='17.5' width='18' height='5' rx='1.4' fill='white'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+  <script>
+    // 更新したときに古いファイルが使われないよう、すべてのファイルにバージョンを付けて読み込む
+    // （ファイルを更新したら APP_VERSION を変える）
+    window.APP_VERSION = '2026.11.14';
+    (() => {
+      const v = window.APP_VERSION;
+      const modules = ['app', 'dts', 'layout', 'keycodes', 'describe', 'sim', 'lint', 'github', 'studio', 'studio-map', 'ball', 'print', 'icons'];
+      const imports = {};
+      for (const m of modules) imports[`./js/${m}.js`] = `./js/${m}.js?v=${v}`;
+      imports['./vendor/zmk-studio-client.js'] = `./vendor/zmk-studio-client.js?v=${v}`;
+      const map = document.createElement('script');
+      map.type = 'importmap';
+      map.textContent = JSON.stringify({ imports });
+      document.head.append(map);
+      const css = document.createElement('link');
+      css.rel = 'stylesheet';
+      css.href = `css/style.css?v=${v}`;
+      document.head.append(css);
+    })();
+  </script>
+  <script>
+    // 表示設定（テーマ）を最初に反映して、ちらつきを防ぐ
+    try {
+      const t = JSON.parse(localStorage.getItem('zonkey-kobo:look') || '{}');
+      if (t.palette) document.documentElement.dataset.palette = t.palette;
+      if (t.mode === 'light' || t.mode === 'dark') document.documentElement.dataset.theme = t.mode;
+    } catch { /* 保存できない環境 */ }
+  </script>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="logo" aria-hidden="true">⌨</span>
-      <div>
-        <h1>Zonkey キーマップ工房</h1>
+      <svg class="logo-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <rect width="32" height="32" rx="9" class="logo-bg"/>
+        <rect x="7" y="9" width="5" height="5" rx="1.4" fill="#fff"/>
+        <rect x="13.5" y="9" width="5" height="5" rx="1.4" fill="#fff"/>
+        <rect x="20" y="9" width="5" height="5" rx="1.4" fill="#fff" opacity=".55"/>
+        <rect x="7" y="17.5" width="18" height="5" rx="1.4" fill="#fff"/>
+      </svg>
+      <div class="brand-text">
+        <h1 id="appName">Zonkey Remap</h1>
         <div class="source" id="sourceInfo">読み込み中…</div>
       </div>
     </div>
     <div class="actions">
       <button id="deviceChip" class="device-chip hidden" title="本体の接続画面を開く"></button>
-      <button id="btnUndo" title="元に戻す（Ctrl+Z）">↶ 元に戻す</button>
-      <button id="btnRedo" title="やり直す（Ctrl+Y）">↷ やり直す</button>
-      <button id="btnLoad">📂 読み込み</button>
-      <button id="btnPdf" title="キーマップを PDF に出力">📄 PDF</button>
-      <button id="btnSave" class="primary">💾 保存</button>
+      <div class="btn-group" role="group" aria-label="履歴">
+        <button id="btnUndo" class="icon-btn" title="元に戻す（Ctrl+Z）" aria-label="元に戻す"><svg class="ic" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg></button>
+        <button id="btnRedo" class="icon-btn" title="やり直す（Ctrl+Y）" aria-label="やり直す"><svg class="ic" viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg></button>
+      </div>
+      <button id="btnLoad" class="ghost" title="キーマップを読み込む"><svg class="ic" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg><span class="lbl">読み込み</span></button>
+      <button id="btnPdf" class="ghost" title="キーマップを PDF に出力"><svg class="ic" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg><span class="lbl">PDF</span></button>
+      <button id="btnSave" class="primary" title="保存（ダウンロード / GitHub）"><svg class="ic" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="m7 8 5-5 5 5"/><path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg><span class="lbl">保存</span></button>
+      <span class="divider" aria-hidden="true"></span>
       <label class="host" title="キーボードをつなぐ PC のキー配列。記号の表示とシミュレーション結果が変わります。">
-        PC の配列
-        <select id="hostSelect">
-          <option value="jis">日本語（JIS）</option>
-          <option value="us">英語（US）</option>
+        <span class="host-lbl">PC</span>
+        <select id="hostSelect" aria-label="PC の配列">
+          <option value="jis">JIS（日本語）</option>
+          <option value="us">US（英語）</option>
         </select>
       </label>
+      <button id="btnLook" class="icon-btn" title="テーマと明るさ" aria-label="テーマと明るさ"><svg class="ic" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r="1.2"/><circle cx="17.5" cy="10.5" r="1.2"/><circle cx="8.5" cy="7.5" r="1.2"/><circle cx="6.5" cy="12.5" r="1.2"/><path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.3 0-1.1.9-2 2-2h2.3A5.7 5.7 0 0 0 22 9.7C22 5.4 17.5 2 12 2Z"/></svg></button>
     </div>
   </header>
 
-  <nav class="modes" role="tablist">
+  <nav class="modes" role="tablist" aria-label="画面">
     <button role="tab" data-mode="edit" class="active">✏️ 編集</button>
     <button role="tab" data-mode="sim">🧪 シミュレーター</button>
     <button role="tab" data-mode="test">🔌 実機テスト</button>
@@ -65,6 +106,6 @@
   <dialog id="dlg"><form method="dialog" id="dlgBody"></form></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-  <script type="module" src="js/app.js"></script>
+  <script type="module">import './js/app.js';</script>
 </body>
 </html>
