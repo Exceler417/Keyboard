@@ -471,6 +471,7 @@ export const BEHAVIOR_TYPES = {
   'mod-morph': 'zmk,behavior-mod-morph',
   'hold-tap': 'zmk,behavior-hold-tap',
   macro: 'zmk,behavior-macro',
+  'sensor-rotate': 'zmk,behavior-sensor-rotate',
 };
 
 export function behaviorType(compatible) {
@@ -512,6 +513,10 @@ function behaviorProps(def) {
     props.push(['flavor', `"${def.flavor || 'balanced'}"`]);
     props.push(['tapping-term-ms', `<${parseInt(def.tappingTerm) || 200}>`]);
     props.push(['quick-tap-ms', parseInt(def.quickTap) > 0 ? `<${parseInt(def.quickTap)}>` : null]);
+  } else if (def.type === 'sensor-rotate') {
+    props.push(['#sensor-binding-cells', '<0>']);
+    props.push(['bindings', `<${def.cw}>, <${def.ccw}>`]);
+    props.push(['tap-ms', parseInt(def.tapMs) > 0 ? `<${parseInt(def.tapMs)}>` : null]);
   } else if (def.type === 'macro') {
     props.push(['#binding-cells', '<0>']);
     props.push(['wait-ms', parseInt(def.waitMs) >= 0 && def.waitMs !== '' && def.waitMs != null ? `<${parseInt(def.waitMs)}>` : null]);
@@ -610,4 +615,14 @@ export function behaviorUsages(parsed, layers, label) {
     out.push({ other: true });
   }
   return out;
+}
+
+/** sensor-bindings の文字列 ⇄ binding の配列 */
+export function parseSensorBindings(raw) {
+  return raw ? parseBindings(raw) : [];
+}
+export function sensorBindingsToString(list) {
+  const items = list.filter(Boolean);
+  if (!items.length) return null;
+  return items.map((b) => `<${bindingToString(b)}>`).join(', ');
 }

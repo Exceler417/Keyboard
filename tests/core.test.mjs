@@ -210,3 +210,43 @@ test('自作の動作を追加・更新・削除できる', () => {
   assert.match(validateBehaviorLabel('mm_q', p), /すでに/);
   assert.equal(validateBehaviorLabel('new_one', p), null);
 });
+
+import { parseSensorBindings, sensorBindingsToString } from '../js/dts.js';
+import { describeSensor } from '../js/describe.js';
+
+test('エンコーダー: 設定の書き換え・自作の回転動作・シミュレーション', () => {
+  // 回転用の動作を追加し、レイヤーごとにエンコーダーを設定
+  let t = upsertBehavior(TEXT, { type: 'sensor-rotate', label: 'enc_scroll_v', cw: '&msc SCRL_DOWN', ccw: '&msc SCRL_UP', tapMs: 20 });
+  let p = parseKeymap(t);
+  assert.equal(p.behaviors.enc_scroll_v.compatible, 'zmk,behavior-sensor-rotate');
+  const layers = editable(p);
+  layers[0].sensorBindings = sensorBindingsToString([{ behavior: 'inc_dec_kp', params: ['C_VOL_UP', 'C_VOL_DN'] }]);
+  layers[1].sensorBindings = sensorBindingsToString([{ behavior: 'enc_scroll_v', params: [] }]);
+  layers[2].sensorBindings = sensorBindingsToString([{ behavior: 'trans', params: [] }]);
+  t = serializeKeymap(p, layers, ROW_SIZES);
+  p = parseKeymap(t);
+  assert.deepEqual(p.errors, []);
+  assert.equal(p.layers[0].sensorBindings, '<&inc_dec_kp C_VOL_UP C_VOL_DN>');
+  assert.deepEqual(parseSensorBindings(p.layers[1].sensorBindings), [{ behavior: 'enc_scroll_v', params: [] }]);
+  assert.equal(sensorBindingsToString([]), null);
+
+  const ctx = { parsed: p, host: 'jis' };
+  assert.equal(describeSensor(parseSensorBindings(p.layers[0].sensorBindings)[0], ctx).cw.tap, 'Vol+');
+  assert.equal(describeSensor(parseSensorBindings(p.layers[1].sensorBindings)[0], ctx).ccw.tap, 'スクロール↑');
+
+  const sensors = p.layers.map((l) => parseSensorBindings(l.sensorBindings));
+  const { sim, adv, tap } = makeSim(p);
+  sim.rotate(0, 1, sensors);
+  sim.rotate(0, -1, sensors);
+  assert.deepEqual(sim.reports.map((r) => r.label), ['Vol+', 'Vol-']);
+  // レイヤー1 では自作のスクロール
+  sim.press(38); adv(250);
+  sim.rotate(0, 1, sensors);
+  sim.release(38); adv(10);
+  assert.match(sim.reports.at(-1).label, /スクロール↓/);
+  // レイヤー2（透過）では下のレイヤー0 の音量
+  sim.layerOn(2);
+  sim.rotate(0, 1, sensors);
+  assert.equal(sim.reports.at(-1).label, 'Vol+');
+  void tap;
+});
