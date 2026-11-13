@@ -22,6 +22,7 @@
       <button id="btnUndo" title="元に戻す（Ctrl+Z）">↶ 元に戻す</button>
       <button id="btnRedo" title="やり直す（Ctrl+Y）">↷ やり直す</button>
       <button id="btnLoad">📂 読み込み</button>
+      <button id="btnPdf" title="キーマップを PDF に出力">📄 PDF</button>
       <button id="btnSave" class="primary">💾 保存</button>
       <label class="host" title="キーボードをつなぐ PC のキー配列。記号の表示とシミュレーション結果が変わります。">
         PC の配列
@@ -59,6 +60,8 @@
     <section class="panel hidden" id="panelBall"></section>
   </main>
 
+  <div id="printArea" aria-hidden="true"></div>
+  <style id="printPageStyle"></style>
   <dialog id="dlg"><form method="dialog" id="dlgBody"></form></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
