@@ -1,5 +1,5 @@
 {
-  "name": "zonkey-keymap-kobo",
+  "name": "zonkey-remap",
   "version": "1.0.0",
   "private": true,
   "description": "Zonkey（ZMK）のキーマップを日本語で編集・テストするブラウザアプリ",

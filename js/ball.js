@@ -103,7 +103,7 @@ export function writeConf(text, changes) {
   const add = Object.entries(changes).filter(([k, v]) => v != null && !done.has(k));
   if (add.length) {
     while (out.length && out[out.length - 1] === '') out.pop();
-    out.push('', '# トラックボールの設定（Zonkey キーマップ工房）');
+    out.push('', '# トラックボールの設定（Zonkey Remap）');
     for (const [k, v] of add) out.push(`CONFIG_${k}=${v}`);
     out.push('');
   } else if (out[out.length - 1] !== '') {
